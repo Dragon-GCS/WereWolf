@@ -1,0 +1,95 @@
+# 狼人杀角色配置文件
+
+# 默认预设名（必须是 presets 中存在的 name）
+default: "标准9人局"
+
+# 角色定义
+roles:
+  werewolf:
+    display_name: "狼人"
+    team: werewolf
+  villager:
+    display_name: "村民"
+    team: villager
+  seer:
+    display_name: "预言家"
+    team: villager
+  witch:
+    display_name: "女巫"
+    team: villager
+  hunter:
+    display_name: "猎人"
+    team: villager
+  guard:
+    display_name: "守卫"
+    team: villager
+  idiot:
+    display_name: "白痴"
+    team: villager
+
+# 预设局
+presets:
+  - name: "6人局（快速）"
+    description: "2狼 + 预言家 + 女巫 + 2村民"
+    roles:
+      - werewolf
+      - werewolf
+      - seer
+      - witch
+      - villager
+      - villager
+
+  - name: "标准8人局"
+    description: "2狼 + 预言家 + 女巫 + 猎人 + 3村民"
+    roles:
+      - werewolf
+      - werewolf
+      - seer
+      - witch
+      - hunter
+      - villager
+      - villager
+      - villager
+
+  - name: "标准9人局"
+    description: "2狼 + 预言家 + 女巫 + 猎人 + 4村民"
+    roles:
+      - werewolf
+      - werewolf
+      - seer
+      - witch
+      - hunter
+      - villager
+      - villager
+      - villager
+      - villager
+
+  - name: "标准10人局"
+    description: "3狼 + 预言家 + 女巫 + 猎人 + 守卫 + 3村民"
+    roles:
+      - werewolf
+      - werewolf
+      - werewolf
+      - seer
+      - witch
+      - hunter
+      - guard
+      - villager
+      - villager
+      - villager
+
+  - name: "标准12人局"
+    description: "3狼 + 预言家 + 女巫 + 猎人 + 守卫 + 白痴 + 4村民"
+    roles:
+      - werewolf
+      - werewolf
+      - werewolf
+      - seer
+      - witch
+      - hunter
+      - guard
+      - idiot
+      - villager
+      - villager
+      - villager
+      - villager
