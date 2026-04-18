@@ -1,40 +1,22 @@
-"""角色模块：定义角色类及角色工厂"""
+"""角色模块：从配置构建角色实例"""
 
-import logging
-from typing import List
+from dataclasses import dataclass
+from typing import Literal
 
-from .skills import (
-    GuardProtect,
-    HunterShoot,
-    IdiotReveal,
-    SeerCheck,
-    Skill,
-    WerewolfKill,
-    WitchPoison,
-    WitchSave,
-)
+from server.messages import RoleDict
 
-logger = logging.getLogger(__name__)
+from .skills import Skill, build_skill_from_config
 
 
+@dataclass
 class Role:
-    """角色类"""
+    name: str
+    display_name: str
+    team: Literal["狼人", "村民", "神职", "中立"]
+    skills: list[Skill]
+    description: str = ""
 
-    def __init__(
-        self,
-        name: str,
-        display_name: str,
-        team: str,
-        skills: List[Skill],
-        description: str = "",
-    ):
-        self.name = name
-        self.display_name = display_name
-        self.team = team  # "werewolf" | "villager" | "neutral"
-        self.skills = skills
-        self.description = description
-
-    def to_dict(self) -> dict:
+    def to_dict(self) -> RoleDict:
         return {
             "name": self.name,
             "display_name": self.display_name,
@@ -44,68 +26,21 @@ class Role:
         }
 
 
-# ──────────────────────────── 角色工厂 ────────────────────────────
-
-_ROLE_FACTORIES = {
-    "werewolf": lambda: Role(
-        "werewolf",
-        "狼人",
-        "werewolf",
-        [WerewolfKill()],
-        "夜晚与狼队共同猎杀一名好人",
-    ),
-    "villager": lambda: Role(
-        "villager",
-        "村民",
-        "villager",
-        [],
-        "没有特殊技能，通过推理找出狼人",
-    ),
-    "seer": lambda: Role(
-        "seer",
-        "预言家",
-        "villager",
-        [SeerCheck()],
-        "每晚可查验一名玩家的阵营",
-    ),
-    "witch": lambda: Role(
-        "witch",
-        "女巫",
-        "villager",
-        [WitchSave(), WitchPoison()],
-        "持有解药和毒药各一瓶，可在夜晚使用",
-    ),
-    "hunter": lambda: Role(
-        "hunter",
-        "猎人",
-        "villager",
-        [HunterShoot()],
-        "被淘汰时可以开枪带走一名玩家",
-    ),
-    "guard": lambda: Role(
-        "guard",
-        "守卫",
-        "villager",
-        [GuardProtect()],
-        "每晚守护一名玩家，不能连续守护同一人",
-    ),
-    "idiot": lambda: Role(
-        "idiot",
-        "白痴",
-        "villager",
-        [IdiotReveal()],
-        "被投票出局时翻牌，保留座位但失去投票权",
-    ),
-}
+def build_role_from_config(raw: dict) -> Role:
+    """从 YAML role 配置字典构建 Role 实例（每次返回新实例，技能状态独立）"""
+    if "skills" not in raw or not isinstance(raw["skills"], list):
+        msg = f"角色配置缺少技能列表或格式错误: {raw}"
+        raise ValueError(msg)
+    skills = [build_skill_from_config(s) for s in raw["skills"]]
+    return Role(
+        name=raw["name"],
+        display_name=raw.get("display_name", raw["name"]),
+        team=raw["team"],
+        skills=skills,
+        description=raw.get("description", ""),
+    )
 
 
-def create_role(role_name: str) -> Role:
-    """根据角色名称创建角色实例"""
-    factory = _ROLE_FACTORIES.get(role_name)
-    if factory is None:
-        raise ValueError(f"未知角色: {role_name}")
-    return factory()
-
-
-def get_all_role_names() -> List[str]:
-    return list(_ROLE_FACTORIES.keys())
+def build_role_map(roles_config: list) -> dict[str, dict]:
+    """将 YAML roles 列表转为 {role_name: raw_dict} 映射，供按需构建角色用"""
+    return {r["name"]: r for r in roles_config}

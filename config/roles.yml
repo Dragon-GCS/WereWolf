@@ -1,95 +1,51 @@
-# 狼人杀角色配置文件
+# 角色定义 —— 每个角色的阵营、描述及所使用的技能列表
 
-# 默认预设名（必须是 presets 中存在的 name）
-default: "标准9人局"
-
-# 角色定义
 roles:
-  werewolf:
-    display_name: "狼人"
-    team: werewolf
-  villager:
-    display_name: "村民"
-    team: villager
-  seer:
-    display_name: "预言家"
-    team: villager
-  witch:
-    display_name: "女巫"
-    team: villager
-  hunter:
-    display_name: "猎人"
-    team: villager
-  guard:
-    display_name: "守卫"
-    team: villager
-  idiot:
-    display_name: "白痴"
-    team: villager
+  - name: 狼人
+    display_name: 狼人
+    team: 狼人
+    description: 夜晚与狼队共同猎杀一名好人
+    skills:
+      - 狼人猎杀
 
-# 预设局
-presets:
-  - name: "6人局（快速）"
-    description: "2狼 + 预言家 + 女巫 + 2村民"
-    roles:
-      - werewolf
-      - werewolf
-      - seer
-      - witch
-      - villager
-      - villager
+  - name: 村民
+    display_name: 村民
+    team: 村民
+    description: 没有特殊技能，通过推理找出狼人
+    skills: []
 
-  - name: "标准8人局"
-    description: "2狼 + 预言家 + 女巫 + 猎人 + 3村民"
-    roles:
-      - werewolf
-      - werewolf
-      - seer
-      - witch
-      - hunter
-      - villager
-      - villager
-      - villager
+  - name: 预言家
+    display_name: 预言家
+    team: 神职
+    description: 每晚可查验一名玩家的阵营
+    skills:
+      - 预言家查验
 
-  - name: "标准9人局"
-    description: "2狼 + 预言家 + 女巫 + 猎人 + 4村民"
-    roles:
-      - werewolf
-      - werewolf
-      - seer
-      - witch
-      - hunter
-      - villager
-      - villager
-      - villager
-      - villager
+  - name: 女巫
+    display_name: 女巫
+    team: 神职
+    description: 持有解药和毒药各一瓶，可在夜晚使用
+    skills:
+      - 女巫解药
+      - 女巫毒药
 
-  - name: "标准10人局"
-    description: "3狼 + 预言家 + 女巫 + 猎人 + 守卫 + 3村民"
-    roles:
-      - werewolf
-      - werewolf
-      - werewolf
-      - seer
-      - witch
-      - hunter
-      - guard
-      - villager
-      - villager
-      - villager
+  - name: 猎人
+    display_name: 猎人
+    team: 神职
+    description: 被淘汰时可以开枪带走一名玩家
+    skills:
+      - 猎人开枪
 
-  - name: "标准12人局"
-    description: "3狼 + 预言家 + 女巫 + 猎人 + 守卫 + 白痴 + 4村民"
-    roles:
-      - werewolf
-      - werewolf
-      - werewolf
-      - seer
-      - witch
-      - hunter
-      - guard
-      - idiot
-      - villager
-      - villager
-      - villager
-      - villager
+  - name: 守卫
+    display_name: 守卫
+    team: 神职
+    description: 每晚守护一名玩家，不能连续守护同一人
+    skills:
+      - 守卫守护
+
+  - name: 白痴
+    display_name: 白痴
+    team: 神职
+    description: 被投票出局时翻牌，保留座位但失去投票权
+    skills:
+      - 白痴翻牌

@@ -1,5 +1,6 @@
 """FastAPI 应用：HTTP 路由 + WebSocket 消息处理"""
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,18 +11,70 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .connection_manager import manager
-from .game import get_game, init_game
+from .game import Game, get_game, init_game
 
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATE_PATH = BASE_DIR / "templates" / "index.html"
-CONFIG_PATH = BASE_DIR / "config" / "roles.yml"
+CONFIG_DIR = BASE_DIR / "config"
 
 
-def _load_config() -> dict:
-    with CONFIG_PATH.open(encoding="utf-8") as f:
-        return yaml.safe_load(f)
+def _load_role_map() -> dict:
+    """读取 skills.yml + roles.yml，将技能引用展开，返回 {role_name: raw_dict} 映射"""
+    skills_path = CONFIG_DIR / "skills.yml"
+    roles_path = CONFIG_DIR / "roles.yml"
+
+    skills_index: dict = {}
+    if skills_path.exists():
+        with skills_path.open(encoding="utf-8") as f:
+            skills_index = {s["name"]: s for s in yaml.safe_load(f).get("skills", [])}
+
+    role_map: dict = {}
+    if roles_path.exists():
+        with roles_path.open(encoding="utf-8") as f:
+            for role in yaml.safe_load(f).get("roles", []):
+                expanded = [skills_index[s] for s in role.get("skills", []) if s in skills_index]
+                role_map[role["name"]] = {**role, "skills": expanded}
+
+    return role_map
+
+
+def _load_preset(name: str) -> dict:
+    """按名称（不含.yml）加载预设配置，自动从 roles_def.yml 注入角色定义"""
+    path = CONFIG_DIR / f"{name}.yml"
+    if not path.exists():
+        raise FileNotFoundError(f"预设文件不存在: {path}")
+    with path.open(encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    if "roles" not in config:
+        role_map = _load_role_map()
+        used = dict.fromkeys(config.get("roster", []))  # 保持顺序去重
+        config["roles"] = [role_map[r] for r in used if r in role_map]
+
+    return config
+
+
+def _list_presets() -> list:
+    """扫描 config/ 目录，返回所有预设的名称和描述"""
+    presets = []
+    for p in sorted(CONFIG_DIR.glob("*.yml")):
+        name = p.stem
+        if name in ("skills", "roles"):
+            continue
+        try:
+            cfg = yaml.safe_load(p.read_text(encoding="utf-8"))
+            presets.append(
+                {
+                    "name": name,
+                    "description": cfg["description"],
+                    "player_count": len(cfg["roster"]),
+                }
+            )
+        except Exception:
+            logger.warning("解析预设文件失败: %s", p)
+    return presets
 
 
 @asynccontextmanager
@@ -33,7 +86,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="狼人杀助手", lifespan=lifespan)
 
-# 挂载静态资源
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
@@ -45,22 +97,20 @@ async def index():
     return TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
-@app.get("/api/config")
-async def get_config():
-    """返回角色预设配置"""
-    return _load_config()
+@app.get("/api/presets")
+async def get_presets():
+    """返回所有可用预设列表"""
+    return {"presets": _list_presets()}
 
 
 @app.get("/api/state")
 async def get_state():
-    game = get_game()
-    return game.get_public_state()
+    return get_game().get_public_state()
 
 
 @app.get("/api/events")
 async def get_events():
-    game = get_game()
-    return {"events": game.events.get_all()}
+    return {"events": get_game().events.get_all()}
 
 
 # ──────────────────────────── WebSocket ────────────────────────────
@@ -71,26 +121,16 @@ async def websocket_endpoint(ws: WebSocket):
     await manager.accept(ws)
     game = get_game()
 
-    # 发送初始游戏状态
-    await manager.send_to_ws(
-        ws,
-        {
-            "type": "game_state",
-            "data": game.get_public_state(),
-        },
-    )
+    await manager.send_to_ws(ws, {"type": "game_state", "data": game.get_public_state()})
 
     try:
         while True:
             raw = await ws.receive_text()
             try:
-                import json as _j
-
-                msg = _j.loads(raw)
+                msg = json.loads(raw)
             except Exception:
                 logger.warning("[WS] 非法 JSON")
                 continue
-
             await _handle_message(ws, msg, game)
 
     except WebSocketDisconnect:
@@ -99,100 +139,73 @@ async def websocket_endpoint(ws: WebSocket):
             player = game.get_player_by_seat(seat)
             if player:
                 logger.info("[断开] %d 号 %s 离线", player.seat, player.nickname)
-        await manager.broadcast(
-            {
-                "type": "game_state",
-                "data": game.get_public_state(),
-            }
-        )
+        await manager.broadcast({"type": "game_state", "data": game.get_public_state()})
 
 
-async def _handle_message(ws: WebSocket, msg: dict, game):
+async def _handle_message(ws: WebSocket, msg: dict, game: Game):
     msg_type = msg.get("type")
     data = msg.get("data", {})
 
-    # ── 加入游戏 ──
     if msg_type == "join":
         seat = data.get("seat")
         nickname = (data.get("nickname") or "").strip()
         if not isinstance(seat, int) or seat < 1 or not nickname:
             await manager.send_to_ws(
-                ws,
-                {
-                    "type": "error",
-                    "data": {"message": "座位号和昵称不能为空"},
-                },
+                ws, {"type": "error", "data": {"message": "座位号和昵称不能为空"}}
             )
             return
 
         success, message, is_reconnect = game.add_or_update_player(seat, nickname)
-        # 无论是新加入还是重连，绑定 ws -> seat
         if success:
             manager.bind(seat, ws)
         await manager.send_to_ws(
-            ws,
-            {
-                "type": "join_result",
-                "data": {"success": success, "message": message},
-            },
+            ws, {"type": "join_result", "data": {"success": success, "message": message}}
         )
         if success:
-            # 重连时重新发送私密角色信息
             player = game.get_player_by_seat(seat)
             if player and player.role:
                 await manager.send_to_seat(
-                    seat,
-                    {
-                        "type": "your_info",
-                        "data": player.to_private_dict(),
-                    },
+                    seat, {"type": "your_info", "data": player.to_private_dict()}
                 )
-            await manager.broadcast(
-                {
-                    "type": "game_state",
-                    "data": game.get_public_state(),
-                }
-            )
+            await manager.broadcast({"type": "game_state", "data": game.get_public_state()})
 
-    # ── 技能操作 ──
     elif msg_type == "action":
-        target = data.get("target")
         seat = manager.get_seat_by_ws(ws)
         if seat is None:
             return
-        ok = game.submit_action(seat, target)
+        ok = game.submit_action(seat, data.get("target"))
         if not ok:
             await manager.send_to_ws(
-                ws,
-                {
-                    "type": "error",
-                    "data": {"message": "当前不是你的行动时机"},
-                },
+                ws, {"type": "error", "data": {"message": "当前不是你的行动时机"}}
             )
 
-    # ── 投票 ──
     elif msg_type == "vote":
-        target = data.get("target")
         seat = manager.get_seat_by_ws(ws)
         if seat is None:
             return
-        ok = game.submit_action(seat, target)
+        ok = game.submit_action(seat, data.get("target"))
         if not ok:
-            await manager.send_to_ws(
-                ws,
-                {
-                    "type": "error",
-                    "data": {"message": "当前不是投票阶段"},
-                },
-            )
+            await manager.send_to_ws(ws, {"type": "error", "data": {"message": "当前不是投票阶段"}})
 
-    # ── 发言结束 ──
+    elif msg_type == "witch_action":
+        seat = manager.get_seat_by_ws(ws)
+        if seat is not None:
+            ok = game.submit_witch_action(seat, data.get("save"), data.get("poison"))
+            if not ok:
+                await manager.send_to_ws(
+                    ws, {"type": "error", "data": {"message": "当前不是女巫行动时机"}}
+                )
+
     elif msg_type == "speech_end":
         seat = manager.get_seat_by_ws(ws)
         if seat is not None:
             game.submit_speech_end(seat)
 
-    # ── 管理员命令 ──
+    elif msg_type == "audio_done":
+        seat = manager.get_seat_by_ws(ws)
+        if seat is not None:
+            manager.notify_audio_done(seat)
+
     elif msg_type == "admin":
         await _handle_admin(ws, data, game)
 
@@ -205,35 +218,42 @@ async def _handle_admin(ws: WebSocket, data: dict, game):
     result_msg = "未知命令"
 
     if command == "start_game":
-        preset = data.get("preset")
-        custom = data.get("roles")
-        if preset:
-            config = _load_config()
-            presets_list = config.get("presets", [])
-            matched = next((p for p in presets_list if p.get("name") == preset), None)
-            if not matched:
+        preset_name = data.get("preset")
+        custom_roster = data.get("roles")
+
+        if preset_name:
+            try:
+                config = _load_preset(preset_name)
+            except FileNotFoundError as e:
+                await manager.send_to_ws(ws, {"type": "error", "data": {"message": str(e)}})
+                return
+            roster = config.get("roster", [])
+        elif custom_roster:
+            # 自定义角色列表时必须同时提供配置或使用默认配置
+            # 这里要求同时提供 preset 基础配置名，否则无法获得 role 定义
+            base_preset = data.get("base_preset")
+            if not base_preset:
                 await manager.send_to_ws(
                     ws,
                     {
                         "type": "error",
-                        "data": {"message": f"预设 '{preset}' 不存在"},
+                        "data": {"message": "自定义角色列表需要提供 base_preset 参数"},
                     },
                 )
                 return
-            role_list = matched.get("roles", [])
-        elif custom:
-            role_list = custom
+            try:
+                config = _load_preset(base_preset)
+            except FileNotFoundError as e:
+                await manager.send_to_ws(ws, {"type": "error", "data": {"message": str(e)}})
+                return
+            roster = custom_roster
         else:
             await manager.send_to_ws(
-                ws,
-                {
-                    "type": "error",
-                    "data": {"message": "请提供预设名称或角色列表"},
-                },
+                ws, {"type": "error", "data": {"message": "请提供 preset 或 roles"}}
             )
             return
 
-        _success, result_msg = await game.start_game(role_list)
+        _success, result_msg = await game.start_game(roster, config, preset_name=preset_name or "")
 
     elif command == "skip_phase":
         result_msg = await game.admin_skip_phase()
@@ -262,16 +282,5 @@ async def _handle_admin(ws: WebSocket, data: dict, game):
         manager.audio_device_seat = seat if isinstance(seat, int) else None
         result_msg = f"音频设备已设为 {seat} 号" if seat else "音频设备已设为广播模式"
 
-    await manager.send_to_ws(
-        ws,
-        {
-            "type": "admin_result",
-            "data": {"message": result_msg},
-        },
-    )
-    await manager.broadcast(
-        {
-            "type": "game_state",
-            "data": game.get_public_state(),
-        }
-    )
+    await manager.send_to_ws(ws, {"type": "admin_result", "data": {"message": result_msg}})
+    await manager.broadcast({"type": "game_state", "data": game.get_public_state()})

@@ -1,6 +1,8 @@
 """玩家模块"""
 
-from typing import Optional
+from typing import Literal, Optional
+
+from server.messages import PublicPlayerDict, YourInfoData
 
 from .roles import Role
 
@@ -16,7 +18,19 @@ class Player:
         self.can_vote: bool = True
         self.is_sheriff: bool = False
 
-    def to_public_dict(self) -> dict:
+    @property
+    def skills(self):
+        if not self.role:
+            raise ValueError("玩家没有分配角色")
+        return self.role.skills
+
+    @property
+    def team(self) -> Literal["狼人", "好人"]:
+        if not self.role:
+            raise ValueError("玩家没有分配角色")
+        return "狼人" if self.role.team == "狼人" else "好人"
+
+    def to_public_dict(self) -> PublicPlayerDict:
         """公开信息（广播给所有玩家）"""
         return {
             "seat": self.seat,
@@ -26,7 +40,7 @@ class Player:
             "role_display": self.role.display_name if not self.is_alive and self.role else None,
         }
 
-    def to_private_dict(self) -> dict:
+    def to_private_dict(self) -> YourInfoData:
         """私密信息（仅发给本人）"""
         return {
             "seat": self.seat,

@@ -1,0 +1,72 @@
+# 技能定义 —— 每个技能的行为参数和音效
+
+skills:
+  - name: 狼人猎杀
+    display_name: 猎杀
+    priority: 20
+    phase: night
+    open_msg: 狼人请睁眼
+    close_msg: 狼人请闭眼
+    open_audio: [狼人.mp3, 请睁眼.mp3]
+    action_audio: [狼人.mp3, 请执行操作.mp3]
+    close_audio: [狼人.mp3, 请闭眼.mp3]
+
+  - name: 预言家查验
+    display_name: 查验
+    priority: 40
+    phase: night
+    open_msg: 预言家请睁眼
+    close_msg: 预言家请闭眼
+    open_audio: [预言家.mp3, 请睁眼.mp3]
+    action_audio: [预言家.mp3, 请执行操作.mp3]
+    close_audio: [预言家.mp3, 请闭眼.mp3]
+
+  - name: 女巫解药
+    display_name: 使用解药
+    priority: 30
+    phase: night
+    open_msg: 女巫请睁眼
+    close_msg: null
+    open_audio: [女巫.mp3, 请睁眼.mp3]
+    action_audio: [女巫.mp3, 请执行操作.mp3]
+    close_audio: null
+
+  - name: 女巫毒药
+    display_name: 使用毒药
+    priority: 31
+    phase: night
+    open_msg: null
+    close_msg: 女巫请闭眼
+    open_audio: null
+    action_audio: null
+    close_audio: [女巫.mp3, 请闭眼.mp3]
+
+  - name: 猎人开枪
+    display_name: 开枪
+    priority: 0
+    phase: on_death
+    open_msg: null
+    close_msg: null
+    open_audio: [猎人.mp3, 发动技能.mp3]
+    action_audio: null
+    close_audio: null
+
+  - name: 守卫守护
+    display_name: 守护
+    priority: 10
+    phase: night
+    open_msg: 守卫请睁眼
+    close_msg: 守卫请闭眼
+    open_audio: [守卫.mp3, 请睁眼.mp3]
+    action_audio: [守卫.mp3, 请执行操作.mp3]
+    close_audio: [守卫.mp3, 请闭眼.mp3]
+
+  - name: 白痴翻牌
+    display_name: 翻牌
+    priority: 0
+    phase: on_death
+    open_msg: null
+    close_msg: null
+    open_audio: null
+    action_audio: null
+    close_audio: null

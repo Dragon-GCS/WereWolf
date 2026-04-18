@@ -1,0 +1,30 @@
+description: "2狼 + 预言家 + 女巫 + 猎人 + 3村民"
+
+roster:
+  - 狼人
+  - 狼人
+  - 预言家
+  - 女巫
+  - 猎人
+  - 村民
+  - 村民
+  - 村民
+
+game_stages:
+  - name: 夜晚
+    actions:
+      - role: 狼人
+        skill: 狼人猎杀
+      - role: 女巫
+        skill: 女巫解药
+      - role: 女巫
+        skill: 女巫毒药
+      - role: 预言家
+        skill: 预言家查验
+
+  - name: 白天
+    actions:
+      - role: all
+        skill: speech
+      - role: all
+        skill: vote
