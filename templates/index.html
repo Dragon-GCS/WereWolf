@@ -806,6 +806,7 @@
         <div class="admin-divider"></div>
         <div class="admin-row">
           <button class="btn btn-warn btn-sm" style="flex:1" onclick="adminSkip()">⏭ 跳过步骤</button>
+          <button class="btn btn-warn btn-sm" style="flex:1" onclick="adminGotoNight()">🌙 强制入夜</button>
           <button class="btn btn-danger btn-sm" style="flex:1" onclick="adminReset()">🔄 重置游戏</button>
         </div>
         <div class="admin-row">
@@ -997,7 +998,7 @@
       const ph = document.getElementById('phase-action');
       ph.textContent = current_action || phase_display || '等待开始';
       ph.className = '';
-      if (phase === 'night' || phase === 'dawn') ph.classList.add('night');
+      if (phase === 'night') ph.classList.add('night');
       else if (phase === 'day_discuss') ph.classList.add('day');
       else if (phase === 'day_vote') ph.classList.add('vote');
       else if (phase === 'game_over') ph.classList.add('over');
@@ -1337,6 +1338,7 @@
     function adminStartPreset() { const p = document.getElementById('preset-sel').value; if (!p) { toast('请选择预设'); return; } adminSend('start_game', { preset: p }); }
     function adminStartCustom() { const v = document.getElementById('custom-roles').value.trim(); if (!v) { toast('请输入角色列表'); return; } adminSend('start_game', { roles: v.split(',').map(r => r.trim()).filter(Boolean) }); }
     function adminSkip() { adminSend('skip_phase'); }
+    function adminGotoNight() { adminSend('goto_night'); }
     function adminReset() { if (confirm('确认重置游戏？')) adminSend('reset_game'); }
     function adminKill() { const s = +document.getElementById('admin-seat').value; if (s) adminSend('force_kill', { seat: s }); }
     function adminRevive() { const s = +document.getElementById('admin-seat').value; if (s) adminSend('force_revive', { seat: s }); }

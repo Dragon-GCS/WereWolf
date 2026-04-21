@@ -1,51 +1,83 @@
-# 角色定义 —— 每个角色的阵营、描述及所使用的技能列表
+# 角色定义 —— 每个角色的阵营、描述及夜晚行动配置
 
 roles:
   - name: 狼人
     display_name: 狼人
     team: 狼人
     description: 夜晚与狼队共同猎杀一名好人
-    skills:
-      - 狼人猎杀
+    phase: night
+    open_msg: 狼人请睁眼
+    open_audio:
+      - 狼人.mp3
+      - 请睁眼.mp3
+    action_audio:
+      - 请执行操作.mp3
+    close_msg: 狼人请闭眼
+    close_audio:
+      - 狼人.mp3
+      - 请闭眼.mp3
 
   - name: 村民
     display_name: 村民
     team: 村民
     description: 没有特殊技能，通过推理找出狼人
-    skills: []
 
   - name: 预言家
     display_name: 预言家
     team: 神职
     description: 每晚可查验一名玩家的阵营
-    skills:
-      - 预言家查验
+    phase: night
+    open_msg: 预言家请睁眼
+    open_audio:
+      - 预言家.mp3
+      - 请睁眼.mp3
+    action_audio:
+      - 请执行操作.mp3
+    close_msg: 预言家请闭眼
+    close_audio:
+      - 预言家.mp3
+      - 请闭眼.mp3
 
   - name: 女巫
     display_name: 女巫
     team: 神职
     description: 持有解药和毒药各一瓶，可在夜晚使用
-    skills:
-      - 女巫解药
-      - 女巫毒药
+    phase: night
+    open_msg: 女巫请睁眼
+    open_audio:
+      - 女巫.mp3
+      - 请睁眼.mp3
+    action_audio:
+      - 请执行操作.mp3
+    close_msg: 女巫请闭眼
+    close_audio:
+      - 女巫.mp3
+      - 请闭眼.mp3
 
   - name: 猎人
     display_name: 猎人
     team: 神职
     description: 被淘汰时可以开枪带走一名玩家
-    skills:
-      - 猎人开枪
+    phase: on_death
 
   - name: 守卫
     display_name: 守卫
     team: 神职
     description: 每晚守护一名玩家，不能连续守护同一人
-    skills:
-      - 守卫守护
+    phase: night
+    open_msg: 守卫请睁眼
+    open_audio:
+      - 守卫.mp3
+      - 请睁眼.mp3
+    action_audio:
+      - 请执行操作.mp3
+    close_msg: 守卫请闭眼
+    close_audio:
+      - 守卫.mp3
+      - 请闭眼.mp3
 
   - name: 白痴
     display_name: 白痴
     team: 神职
     description: 被投票出局时翻牌，保留座位但失去投票权
-    skills:
-      - 白痴翻牌
+    phase: on_vote_out

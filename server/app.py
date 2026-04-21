@@ -5,11 +5,11 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import yaml
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from .config import list_presets, load_preset
 from .connection_manager import manager
 from .game import Game, get_game, init_game
 
@@ -17,64 +17,6 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATE_PATH = BASE_DIR / "templates" / "index.html"
-CONFIG_DIR = BASE_DIR / "config"
-
-
-def _load_role_map() -> dict:
-    """读取 skills.yml + roles.yml，将技能引用展开，返回 {role_name: raw_dict} 映射"""
-    skills_path = CONFIG_DIR / "skills.yml"
-    roles_path = CONFIG_DIR / "roles.yml"
-
-    skills_index: dict = {}
-    if skills_path.exists():
-        with skills_path.open(encoding="utf-8") as f:
-            skills_index = {s["name"]: s for s in yaml.safe_load(f).get("skills", [])}
-
-    role_map: dict = {}
-    if roles_path.exists():
-        with roles_path.open(encoding="utf-8") as f:
-            for role in yaml.safe_load(f).get("roles", []):
-                expanded = [skills_index[s] for s in role.get("skills", []) if s in skills_index]
-                role_map[role["name"]] = {**role, "skills": expanded}
-
-    return role_map
-
-
-def _load_preset(name: str) -> dict:
-    """按名称（不含.yml）加载预设配置，自动从 roles_def.yml 注入角色定义"""
-    path = CONFIG_DIR / f"{name}.yml"
-    if not path.exists():
-        raise FileNotFoundError(f"预设文件不存在: {path}")
-    with path.open(encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    if "roles" not in config:
-        role_map = _load_role_map()
-        used = dict.fromkeys(config.get("roster", []))  # 保持顺序去重
-        config["roles"] = [role_map[r] for r in used if r in role_map]
-
-    return config
-
-
-def _list_presets() -> list:
-    """扫描 config/ 目录，返回所有预设的名称和描述"""
-    presets = []
-    for p in sorted(CONFIG_DIR.glob("*.yml")):
-        name = p.stem
-        if name in ("skills", "roles"):
-            continue
-        try:
-            cfg = yaml.safe_load(p.read_text(encoding="utf-8"))
-            presets.append(
-                {
-                    "name": name,
-                    "description": cfg["description"],
-                    "player_count": len(cfg["roster"]),
-                }
-            )
-        except Exception:
-            logger.warning("解析预设文件失败: %s", p)
-    return presets
 
 
 @asynccontextmanager
@@ -100,7 +42,7 @@ async def index():
 @app.get("/api/presets")
 async def get_presets():
     """返回所有可用预设列表"""
-    return {"presets": _list_presets()}
+    return {"presets": list_presets()}
 
 
 @app.get("/api/state")
@@ -213,7 +155,7 @@ async def _handle_message(ws: WebSocket, msg: dict, game: Game):
         logger.debug("[WS] 未知消息类型：%s", msg_type)
 
 
-async def _handle_admin(ws: WebSocket, data: dict, game):
+async def _handle_admin(ws: WebSocket, data: dict, game: Game):
     command = data.get("command")
     result_msg = "未知命令"
 
@@ -223,7 +165,7 @@ async def _handle_admin(ws: WebSocket, data: dict, game):
 
         if preset_name:
             try:
-                config = _load_preset(preset_name)
+                config = load_preset(preset_name)
             except FileNotFoundError as e:
                 await manager.send_to_ws(ws, {"type": "error", "data": {"message": str(e)}})
                 return
@@ -242,7 +184,7 @@ async def _handle_admin(ws: WebSocket, data: dict, game):
                 )
                 return
             try:
-                config = _load_preset(base_preset)
+                config = load_preset(base_preset)
             except FileNotFoundError as e:
                 await manager.send_to_ws(ws, {"type": "error", "data": {"message": str(e)}})
                 return
@@ -259,16 +201,19 @@ async def _handle_admin(ws: WebSocket, data: dict, game):
         result_msg = await game.admin_skip_phase()
 
     elif command == "force_kill":
-        result_msg = await game.admin_force_kill(data.get("seat"))
+        result_msg = await game.admin_force_kill(data["seat"])
 
     elif command == "force_revive":
-        result_msg = await game.admin_force_revive(data.get("seat"))
+        result_msg = await game.admin_force_revive(data["seat"])
 
     elif command == "set_sheriff":
-        result_msg = await game.admin_set_sheriff(data.get("seat"))
+        result_msg = await game.admin_set_sheriff(data["seat"])
 
     elif command == "reset_game":
         result_msg = await game.admin_reset()
+
+    elif command == "goto_night":
+        result_msg = await game.admin_goto_night()
 
     elif command == "rollback":
         event_id = data.get("event_id")

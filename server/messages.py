@@ -5,20 +5,13 @@ from typing import Literal, Optional, TypedDict
 # ── 子结构 ──────────────────────────────────────────────
 
 
-class SkillDict(TypedDict):
-    name: str
-    display_name: str
-    phase: str
-    priority: int
-    can_skip: bool
-
-
 class RoleDict(TypedDict):
     name: str
     display_name: str
     team: Literal["狼人", "村民", "神职", "中立"]
     description: str
-    skills: list[SkillDict]
+    phase: Optional[str]
+    can_skip: bool
 
 
 class PublicPlayerDict(TypedDict):

@@ -19,12 +19,6 @@ class Player:
         self.is_sheriff: bool = False
 
     @property
-    def skills(self):
-        if not self.role:
-            raise ValueError("玩家没有分配角色")
-        return self.role.skills
-
-    @property
     def team(self) -> Literal["狼人", "好人"]:
         if not self.role:
             raise ValueError("玩家没有分配角色")

@@ -11,18 +11,11 @@ roster:
 game_stages:
   - name: 夜晚
     actions:
-      - role: 狼人
-        skill: 狼人猎杀
-      - role: 女巫
-        skill: 女巫解药
-      - role: 女巫
-        skill: 女巫毒药
-      - role: 预言家
-        skill: 预言家查验
+      - 狼人
+      - 女巫
+      - 预言家
 
   - name: 白天
     actions:
-      - role: all
-        skill: speech
-      - role: all
-        skill: vote
+      - speech
+      - vote

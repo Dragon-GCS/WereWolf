@@ -12,8 +12,15 @@ from server.messages import GameStateData, SeerResultItem, SeerResultsData
 
 from .events import EventLog
 from .player import Player
-from .roles import build_role_from_config, build_role_map
-from .skills import NightState, Skill, SkillContext, SkillPhase, WitchPoison, WitchSave
+from .roles import (
+    NightState,
+    Role,
+    RoleContext,
+    RolePhase,
+    WitchRole,
+    build_role_from_config,
+    build_role_map,
+)
 
 if TYPE_CHECKING:
     from .connection_manager import ConnectionManager
@@ -25,7 +32,6 @@ class GamePhase(str, Enum):
     WAITING = "waiting"
     NIGHT = "night"
     SHERIFF = "sheriff"
-    DAWN = "dawn"
     DAY_DISCUSS = "day_discuss"
     DAY_VOTE = "day_vote"
     GAME_OVER = "game_over"
@@ -35,7 +41,6 @@ PHASE_DISPLAY = {
     GamePhase.WAITING: "等待开始",
     GamePhase.NIGHT: "黑夜",
     GamePhase.SHERIFF: "竞选警长",
-    GamePhase.DAWN: "黎明",
     GamePhase.DAY_DISCUSS: "白天·讨论",
     GamePhase.DAY_VOTE: "白天·投票",
     GamePhase.GAME_OVER: "游戏结束",
@@ -61,7 +66,7 @@ class Game:
 
         # 从配置加载的数据
         self._role_map: dict[str, dict] = {}  # {role_name: raw_role_dict}
-        self._night_actions: list[dict] = []  # game_stages 中夜晚阶段的 actions
+        self._night_actions: list[str] = []  # game_stages 中夜晚阶段的角色名列表
         self._preset_name: str = ""  # 当前使用的预设名称
 
         # 动作协调
@@ -75,6 +80,9 @@ class Game:
         # 预言家查验记录 {seer_seat: [SeerResult, ...]}
         self.seer_results: dict[int, list[SeerResultItem]] = {}
 
+        # 上帝面板强制进入黑夜标志
+        self._force_night: bool = False
+
     # ──────────────────────────── 配置加载 ────────────────────────────
 
     def load_config(self, config: dict) -> None:
@@ -84,7 +92,8 @@ class Game:
         self._night_actions = []
         for stage in config.get("game_stages", []):
             if stage["name"] == "夜晚":
-                self._night_actions = stage.get("actions", [])
+                # actions 现在是纯角色名字符串列表
+                self._night_actions = [a for a in stage.get("actions", []) if isinstance(a, str)]
 
     # ──────────────────────────── 玩家管理 ────────────────────────────
 
@@ -116,8 +125,8 @@ class Game:
 
     # ──────────────────────────── SkillContext ────────────────────────────
 
-    def _make_ctx(self) -> SkillContext:
-        return SkillContext(
+    def _make_ctx(self) -> RoleContext:
+        return RoleContext(
             players=self.players,
             night_state=self.night_state,
             seer_results=self.seer_results,
@@ -162,35 +171,32 @@ class Game:
         self._game_task = asyncio.create_task(self._game_loop())
         return True, "游戏开始"
 
+    def _check_force_night(self) -> bool:
+        """检查是否有强制进入黑夜指令，有则清除标志并返回 True"""
+        if self._force_night:
+            self._force_night = False
+            return True
+        return False
+
     async def _game_loop(self):
         try:
             while True:
                 self.round += 1
                 logger.info("===== 第 %d 轮 开始 =====", self.round)
                 await self._run_night()
+                if self._check_force_night():
+                    continue
 
                 if self.round == 1:
                     await self._run_sheriff_election()
+                    if self._check_force_night():
+                        continue
 
-                deaths = await self._run_dawn()
-                await self._broadcast_game_state()
-
-                winner = self._check_win()
-                if winner:
-                    await self._end_game(winner)
+                game_over = await self._run_day()
+                if game_over:
                     return
-
-                eliminated = await self._run_day(deaths)
-
-                if eliminated is not None:
-                    await self._handle_on_death(eliminated, cause="vote")
-
-                await self._broadcast_game_state()
-
-                winner = self._check_win()
-                if winner:
-                    await self._end_game(winner)
-                    return
+                if self._check_force_night():
+                    continue
 
         except asyncio.CancelledError:
             logger.info("游戏循环已取消")
@@ -200,35 +206,23 @@ class Game:
     # ──────────────────────────── 私信辅助 ────────────────────────────
 
     async def _broadcast_your_info(self):
-        """向每位有角色的玩家发送 your_info，警长额外附加警长技能"""
+        """向每位有角色的玩家发送 your_info，警长额外注入警长技能"""
         for player in self.players:
             if not player.role:
                 continue
-            info = player.to_private_dict()
-            payload: dict = dict(info)
-            if player.is_sheriff and player.is_alive and info["role"] is not None:
-                sheriff_skills = [
-                    {
-                        "name": "sheriff_direction",
-                        "display_name": "指定发言方向",
-                        "phase": "day",
-                        "priority": 0,
-                        "can_skip": False,
-                        "description": "警长可指定本轮发言从左手或右手方向开始",
-                    },
-                    {
-                        "name": "sheriff_badge_transfer",
-                        "display_name": "移交/销毁警徽",
-                        "phase": "on_death",
-                        "priority": 0,
-                        "can_skip": False,
-                        "description": "警长出局时可将警徽移交给其他玩家，或销毁警徽",
-                    },
-                ]
-                role_dict = dict(info["role"])
-                role_dict["skills"] = list(info["role"]["skills"]) + sheriff_skills
-                payload["role"] = role_dict
-            await self.cm.send_to_seat(player.seat, {"type": "your_info", "data": payload})  # type: ignore[arg-type]
+            data = player.to_private_dict()
+            if player.is_sheriff and data["role"] is not None:
+                # 注入警长特有技能供前端渲染
+                data["role"] = {
+                    **data["role"],
+                    "skills": [
+                        {
+                            "display_name": "警长",
+                            "description": "投票权重 1.5 票，出局时可移交或销毁警徽",
+                        }
+                    ],
+                }
+            await self.cm.send_to_seat(player.seat, {"type": "your_info", "data": data})
 
     # ──────────────────────────── 警长竞选 ────────────────────────────
 
@@ -296,6 +290,8 @@ class Game:
         random.shuffle(shuffled_nominees)
 
         for seat in shuffled_nominees:
+            if self._force_night:
+                break
             player = self.get_player_by_seat(seat)
             self.current_speaker_seat = seat
             self.current_action = f"竞选警长 · {seat} 号 {player.nickname} 发言"
@@ -371,116 +367,97 @@ class Game:
         )
         await self._broadcast_game_state()
 
-        # 按配置的 night actions 顺序执行，witch_save/witch_poison 合并处理
-        processed_witch = False
-        for action_cfg in self._night_actions:
-            role_name = action_cfg["role"]
-            skill_name = action_cfg["skill"]
+        # 按配置的 night actions 顺序执行（角色名列表）
+        for role_name in self._night_actions:
+            # 先取得角色实例，再用 isinstance 判断类型（防止硬编码角色名）
+            role_players = self._get_role_players(role_name)
+            role = role_players[0][1] if role_players else self._get_role_template(role_name)
 
-            # 女巫两个技能合并为一次交互
-            if skill_name in ("女巫解药", "女巫毒药"):
-                if processed_witch:
-                    continue
-                processed_witch = True
+            if isinstance(role, WitchRole):
                 await self._run_witch_night()
                 continue
 
-            # 找出拥有该技能的存活玩家
-            skill_players = self._get_skill_players(role_name, skill_name)
-            if not skill_players:
-                # 维持流程：无人拥有该技能（死亡或不存在），播睁眼/闭眼保持节奏
-                dummy = self._get_skill_template(role_name, skill_name)
-                if dummy:
-                    await self._broadcast_skill_phase(dummy, has_players=False)
+            if not role_players:
+                # 维持流程：无人（死亡或不存在），播睁眼/闭眼保持节奏
+                if role:
+                    await self._broadcast_role_phase(role, has_players=False)
                 continue
 
-            skill = skill_players[0][1]
-            await self._run_skill_group(skill_players, skill)
+            await self._run_role_action(role_players, role)
 
-    def _get_skill_players(self, role_name: str, skill_name: str) -> list[tuple[Player, Skill]]:
-        """找出拥有指定技能的所有玩家（含死亡，死亡时也要广播睁眼/闭眼）"""
-        result = []
-        for player in self.players:
-            if not player.role:
-                continue
-            if role_name != "all" and player.role.name != role_name:
-                continue
-            for skill in player.role.skills:
-                if skill.name == skill_name:
-                    result.append((player, skill))
-                    break
-        return result
+    def _get_role_players(self, role_name: str) -> list[tuple[Player, Role]]:
+        """找出拥有指定角色的所有玩家（含死亡，死亡时也要广播睁眼/闭眼）"""
+        return [
+            (player, player.role)
+            for player in self.players
+            if player.role and player.role.name == role_name
+        ]
 
-    def _get_skill_template(self, role_name: str, skill_name: str) -> Optional[Skill]:
-        """从角色配置中构建一个临时 Skill 实例，用于获取音频/消息配置"""
+    def _get_role_template(self, role_name: str) -> Optional[Role]:
+        """从角色配置中构建一个临时 Role 实例，用于获取音频/消息配置"""
         raw_role = self._role_map.get(role_name)
         if not raw_role:
             return None
-        for raw_skill in raw_role.get("skills", []):
-            if raw_skill["name"] == skill_name:
-                from .skills import build_skill_from_config
+        return build_role_from_config(raw_role)
 
-                return build_skill_from_config(raw_skill)
-        return None
-
-    async def _broadcast_skill_phase(self, skill: Skill, has_players: bool):
-        """广播技能的睁眼/闭眼公告（无论是否有人能用，保持节奏）"""
-        if skill.open_msg:
-            self.current_action = skill.open_msg
-            self.events.log("night_action", skill.open_msg)
-            await self._broadcast_notification(skill.open_msg, audio=skill.open_audio, wait=True)
+    async def _broadcast_role_phase(self, role: Role, has_players: bool):
+        """广播角色的睁眼/闭眼公告（无论是否有人能用，保持节奏）"""
+        if role.open_msg:
+            self.current_action = role.open_msg
+            self.events.log("night_action", role.open_msg)
+            await self._broadcast_notification(role.open_msg, audio=role.open_audio, wait=True)
             await self._broadcast_game_state()
 
-        if not has_players and skill.close_msg:
+        if not has_players and role.close_msg:
             # 无玩家时仍播放执行操作音频保持节奏，不等待前端信号
-            if skill.action_audio:
-                await self.cm.broadcast_audio(skill.action_audio)
-            self.current_action = skill.close_msg
-            self.events.log("night_action", skill.close_msg)
-            await self._broadcast_notification(skill.close_msg, audio=skill.close_audio, wait=True)
+            if role.action_audio:
+                await self.cm.broadcast_audio(role.action_audio)
+            self.current_action = role.close_msg
+            self.events.log("night_action", role.close_msg)
+            await self._broadcast_notification(role.close_msg, audio=role.close_audio, wait=True)
             await self._broadcast_game_state()
 
-    async def _run_skill_group(self, skill_players: list[tuple[Player, Skill]], skill: Skill):
-        """执行一组技能（同优先级/同名技能）"""
+    async def _run_role_action(self, role_players: list[tuple[Player, Role]], role: Role):
+        """执行一组同角色的夜晚行动"""
         ctx = self._make_ctx()
-        able_players = [p for p, s in skill_players if p.is_alive and s.can_use(p, ctx)]
+        able_players = [p for p, r in role_players if p.is_alive and r.can_use(p, ctx)]
 
         # 广播睁眼
-        await self._broadcast_skill_phase(skill, has_players=bool(able_players))
+        await self._broadcast_role_phase(role, has_players=bool(able_players))
 
         if not able_players:
             return
 
-        if skill.action_audio:
-            await self.cm.broadcast_audio(skill.action_audio)
+        if role.action_audio:
+            await self.cm.broadcast_audio(role.action_audio)
 
         seats = [p.seat for p in able_players]
-        results = await self._request_action(seats, skill, message=skill.display_name)
+        results = await self._request_action(seats, role, message=role.display_name)
 
         ctx = self._make_ctx()  # 重新获取，可能有状态更新
 
-        if skill.name == "狼人猎杀":
+        if role.name == "狼人":
             votes = [v for v in results.values() if v is not None]
             if votes:
                 target = Counter(votes).most_common(1)[0][0]
-                result = skill.execute(able_players[0], target, ctx)
+                result = role.execute(able_players[0], target, ctx)
                 self.events.log(
-                    "skill_used", result.message, {"skill": skill.name, "target": target}
+                    "role_action", result.message, {"role": role.name, "target": target}
                 )
         else:
             for seat, target in results.items():
                 player = self.get_player_by_seat(seat)
                 if not player:
                     continue
-                skill_inst = next((s for p, s in skill_players if p.seat == seat), skill)
-                if target is not None or not skill_inst.requires_target():
-                    result = skill_inst.execute(player, target, ctx)
+                role_inst = next((r for p, r in role_players if p.seat == seat), role)
+                if target is not None or not role_inst.requires_target():
+                    result = role_inst.execute(player, target, ctx)
                     self.events.log(
-                        "skill_used",
+                        "role_action",
                         result.message,
-                        {"skill": skill.name, "seat": seat, "target": target},
+                        {"role": role.name, "seat": seat, "target": target},
                     )
-                    if skill.name == "预言家查验" and result.success and target is not None:
+                    if role.name == "预言家" and result.success and target is not None:
                         target_p = ctx.get_player_by_seat(target)
                         if target_p:
                             self.seer_results.setdefault(seat, []).append(
@@ -502,31 +479,29 @@ class Game:
                     )
 
         # 广播闭眼
-        if skill.close_msg:
-            self.current_action = skill.close_msg
-            self.events.log("night_action", skill.close_msg)
-            await self._broadcast_notification(skill.close_msg, audio=skill.close_audio, wait=True)
+        if role.close_msg:
+            self.current_action = role.close_msg
+            self.events.log("night_action", role.close_msg)
+            await self._broadcast_notification(role.close_msg, audio=role.close_audio, wait=True)
             await self._broadcast_game_state()
 
     async def _run_witch_night(self):
         """女巫夜晚：解药+毒药合并为一次交互"""
-        ctx = self._make_ctx()
-        witch_players = [p for p in self.players if p.is_alive and p.role and p.role.name == "女巫"]
-
-        # 从角色技能中取 open/close 配置
-        save_skill_tmpl = self._get_skill_template("女巫", "女巫解药")
-        poison_skill_tmpl = self._get_skill_template("女巫", "女巫毒药")
-        open_msg = save_skill_tmpl.open_msg if save_skill_tmpl else "女巫请睁眼"
-        open_audio = save_skill_tmpl.open_audio if save_skill_tmpl else None
-        action_audio = save_skill_tmpl.action_audio if save_skill_tmpl else None
-        close_msg = poison_skill_tmpl.close_msg if poison_skill_tmpl else "女巫请闭眼"
-        close_audio = poison_skill_tmpl.close_audio if poison_skill_tmpl else None
+        # 从角色配置取 open/close 配置
+        witch_tmpl = self._get_role_template("女巫")
+        open_msg = witch_tmpl.open_msg if witch_tmpl else "女巫请睁眼"
+        open_audio = witch_tmpl.open_audio if witch_tmpl else None
+        action_audio = witch_tmpl.action_audio if witch_tmpl else None
+        close_msg = witch_tmpl.close_msg if witch_tmpl else "女巫请闭眼"
+        close_audio = witch_tmpl.close_audio if witch_tmpl else None
 
         if open_msg:
             self.current_action = open_msg
             self.events.log("night_action", open_msg)
             await self._broadcast_notification(open_msg, audio=open_audio, wait=True)
             await self._broadcast_game_state()
+
+        witch_players = [p for p in self.players if p.is_alive and p.role and p.role.name == "女巫"]
 
         if not witch_players:
             # 女巫已死时播放执行操作音频保持节奏，不等待前端信号
@@ -548,18 +523,17 @@ class Game:
         ctx = self._make_ctx()
         for seat, actions in witch_results.items():
             player = self.get_player_by_seat(seat)
-            if not player:
+            if not player or not isinstance(player.role, WitchRole):
                 continue
-            save_skill = next((s for s in player.skills if isinstance(s, WitchSave)), None)
-            poison_skill = next((s for s in player.skills if isinstance(s, WitchPoison)), None)
+            witch_role = player.role
 
             save_target = actions.get("save")
-            if save_target is not None and save_skill and save_skill.can_use(player, ctx):
-                result = save_skill.execute(player, save_target, ctx)
+            if save_target is not None and witch_role.can_save(player, ctx):
+                result = witch_role.execute_save(player, save_target, ctx)
                 self.events.log(
-                    "skill_used",
+                    "role_action",
                     result.message,
-                    {"skill": "女巫解药", "seat": seat, "target": save_target},
+                    {"role": "女巫解药", "seat": seat, "target": save_target},
                 )
                 await self.cm.send_to_seat(
                     seat,
@@ -570,12 +544,12 @@ class Game:
                 )
 
             poison_target = actions.get("poison")
-            if poison_target is not None and poison_skill and poison_skill.can_use(player, ctx):
-                result = poison_skill.execute(player, poison_target, ctx)
+            if poison_target is not None and witch_role.can_poison(player, ctx):
+                result = witch_role.execute_poison(player, poison_target, ctx)
                 self.events.log(
-                    "skill_used",
+                    "role_action",
                     result.message,
-                    {"skill": "女巫毒药", "seat": seat, "target": poison_target},
+                    {"role": "女巫毒药", "seat": seat, "target": poison_target},
                 )
                 await self.cm.send_to_seat(
                     seat,
@@ -593,8 +567,8 @@ class Game:
 
     # ──────────────────────────── 黎明 ────────────────────────────
 
-    async def _run_dawn(self) -> list[int]:
-        self.phase = GamePhase.DAWN
+    async def _process_night_deaths(self) -> list[int]:
+        """处理夜晚死亡：计算死亡名单、播报公告、触发死亡技能。"""
         self.current_action = f"第 {self.round} 夜 · 黎明公告"
         self.events.log("phase_change", f"第 {self.round} 夜 黎明")
         deaths: list[int] = []
@@ -635,6 +609,7 @@ class Game:
                 )
             for s in deaths:
                 await self._run_badge_transfer(s)
+                await self._handle_on_death(s, cause="night_kill")
         else:
             await self._broadcast_notification("昨夜平安，没有玩家死亡")
 
@@ -642,11 +617,26 @@ class Game:
 
     # ──────────────────────────── 白天 ────────────────────────────
 
-    async def _run_day(self, deaths: list[int]) -> Optional[int]:
-        await asyncio.sleep(3)
+    async def _run_day(self) -> bool:
+        """白天完整流程：黎明公告 → 讨论发言 → 投票。返回 True 表示游戏已结束。"""
         self.phase = GamePhase.DAY_DISCUSS
-        self.current_action = f"第 {self.round} 天 · 请依次发言"
         self.events.log("phase_change", f"第 {self.round} 天白天")
+
+        # ── 黎明公告 ──────────────────────────────────────────────────────
+        deaths = await self._process_night_deaths()
+        await self._broadcast_game_state()
+
+        if self._check_force_night():
+            return False
+
+        winner = self._check_win()
+        if winner:
+            await self._end_game(winner)
+            return True
+
+        # ── 发言 ──────────────────────────────────────────────────────────
+        await asyncio.sleep(3)
+        self.current_action = f"第 {self.round} 天 · 请依次发言"
         await self._broadcast_notification(
             f"第 {self.round} 天，天亮了，请依次发言", audio="天亮了请睁眼.mp3"
         )
@@ -663,20 +653,18 @@ class Game:
 
         if sheriff and alive:
             direction = await self._request_sheriff_direction(sheriff)
-            # direction=1 右手(顺序，座位号递增方向), direction=2 左手(逆序，座位号递减方向)
-            # 警长最后发言：先排除警长，按方向排序其余人，最后加上警长
             others = [p for p in alive if p.seat != sheriff.seat]
             if direction == 2:
-                # 左手：从警长左边开始递减方向（seat递减），警长最后
                 ordered_others = sorted(others, key=lambda p: (sheriff.seat - p.seat) % 100)
             else:
-                # 右手：从警长右边开始递增方向（seat递增），警长最后
                 ordered_others = sorted(others, key=lambda p: (p.seat - sheriff.seat) % 100)
             reordered = [*ordered_others, sheriff]
         else:
             reordered = sorted(alive, key=lambda p: (p.seat - start) % 100)
 
         for player in reordered:
+            if self._force_night:
+                break
             self.current_speaker_seat = player.seat
             self.current_action = f"{player.seat} 号 {player.nickname} 发言中"
             await self._broadcast_game_state()
@@ -688,14 +676,25 @@ class Game:
             await self._wait_speech_end(player.seat, timeout=180)
 
         self.current_speaker_seat = None
+        if self._check_force_night():
+            return False
 
+        # ── 投票 ──────────────────────────────────────────────────────────
         self.phase = GamePhase.DAY_VOTE
         self.current_action = "投票阶段 · 请选择淘汰玩家"
         self.voting_candidates = [p.seat for p in self.get_alive_players()]
         await self._broadcast_notification("请投票选择淘汰玩家（0 表示弃票）", audio="开始投票.mp3")
         await self._broadcast_game_state()
 
-        return await self._run_vote()
+        await self._run_vote()
+
+        winner = self._check_win()
+        if winner:
+            await self._end_game(winner)
+            return True
+
+        await self._broadcast_game_state()
+        return False
 
     async def _run_vote(self) -> Optional[int]:
         eligible_voters = [p for p in self.get_alive_players() if p.can_vote]
@@ -755,7 +754,9 @@ class Game:
             )
             await self._broadcast_game_state()
             await self._run_badge_transfer(loser_seat)
-            if not self._check_win():
+            await self._handle_on_death(loser_seat, cause="vote")
+            # 白痴翻牌后 is_alive=True，跳过遗言
+            if not self._check_win() and not loser.is_alive:
                 await self._run_last_words(loser_seat)
         return loser_seat
 
@@ -841,37 +842,43 @@ class Game:
         if not player or not player.role:
             return
         ctx = self._make_ctx()
+        role = player.role
 
-        for skill in player.role.skills:
-            if skill.phase != SkillPhase.ON_DEATH or not skill.can_use(player, ctx):
-                continue
+        # 根据死因过滤可触发的阶段
+        _night_phases = {RolePhase.ON_NIGHT_KILL, RolePhase.ON_DEATH}
+        _vote_phases = {RolePhase.ON_VOTE_OUT, RolePhase.ON_DEATH}
+        allowed = _night_phases if cause == "night_kill" else _vote_phases
+        if role.phase not in allowed or not role.can_use(player, ctx):
+            return
 
-            if not skill.requires_target():
-                result = skill.execute(player, None, ctx)
-                await self._broadcast_notification(result.message)
-                if result.success:
-                    await self._broadcast_game_state()
-                    return
-                continue
+        if not role.requires_target():
+            result = role.execute(player, None, ctx)
+            await self._broadcast_notification(result.message)
+            if result.success:
+                await self._broadcast_game_state()
+            return
 
-            trigger_audio = skill.open_audio
-            await self._broadcast_notification(
-                f"{seat} 号 {player.nickname} 触发技能：{skill.display_name}",
-                audio=trigger_audio,
-            )
-            results = await self._request_action([seat], skill, message="请选择目标", timeout=60.0)
-            target = results.get(seat)
-            if isinstance(target, int):
-                ctx = self._make_ctx()
-                result = skill.execute(player, target, ctx)
-                await self._broadcast_notification(result.message)
-                for s in result.affected_seats:
-                    killed = self.get_player_by_seat(s)
-                    if killed:
-                        killed.is_alive = False
-                        self.events.log(
-                            "player_died", f"{s} 号 {killed.nickname} 被猎人射杀", {"seat": s}
-                        )
+        trigger_audio = role.open_audio
+        await self._broadcast_notification(
+            f"{seat} 号 {player.nickname} 触发技能：{role.display_name}",
+            audio=trigger_audio,
+        )
+        results = await self._request_action([seat], role, message="请选择目标", timeout=60.0)
+        target = results.get(seat)
+        if isinstance(target, int):
+            ctx = self._make_ctx()
+            result = role.execute(player, target, ctx)
+            await self._broadcast_notification(result.message)
+            await self._broadcast_game_state()
+            for s in result.affected_seats:
+                killed = self.get_player_by_seat(s)
+                if killed and killed.is_alive:
+                    killed.is_alive = False
+                    self.events.log(
+                        "player_died", f"{s} 号 {killed.nickname} 被技能击杀", {"seat": s}
+                    )
+                    await self._run_badge_transfer(s)
+                    await self._handle_on_death(s, cause=cause)
 
     # ──────────────────────────── 胜负判断 ────────────────────────────
 
@@ -901,30 +908,30 @@ class Game:
     async def _request_action(
         self,
         seats: list[int],
-        skill: Skill,
+        role: Role,
         message: str = "",
         timeout: float = 120.0,
     ) -> dict[int, Optional[int]]:
         ctx = self._make_ctx()
-        sample_player = self.get_player_by_seat(seats[0])
-        valid_targets = skill.get_valid_targets(sample_player, ctx) if sample_player else []
 
         self._pending_future = asyncio.get_event_loop().create_future()
         self._pending_seats = set(seats)
         self._pending_votes = {}
 
         for seat in seats:
+            player = self.get_player_by_seat(seat)
+            valid_targets = role.get_valid_targets(player, ctx) if player else []
             await self.cm.send_to_seat(
                 seat,
                 {
                     "type": "action_request",
                     "data": {
-                        "skill": skill.name,
-                        "skill_display": skill.display_name,
-                        "message": message or f"请使用技能：{skill.display_name}",
+                        "skill": role.name,
+                        "skill_display": role.display_name,
+                        "message": message or f"请行动：{role.display_name}",
                         "valid_targets": valid_targets,
-                        "requires_target": skill.requires_target(),
-                        "can_skip": skill.can_skip(),
+                        "requires_target": role.requires_target(),
+                        "can_skip": role.can_skip(),
                         "is_group": len(seats) > 1,
                     },
                 },
@@ -956,12 +963,11 @@ class Game:
         kill_target = self.night_state.kill_target
         for seat in seats:
             player = self.get_player_by_seat(seat)
-            if not player:
+            if not player or not isinstance(player.role, WitchRole):
                 continue
-            save_skill = next((s for s in player.skills if isinstance(s, WitchSave)), None)
-            poison_skill = next((s for s in player.skills if isinstance(s, WitchPoison)), None)
-            can_save = save_skill is not None and save_skill.can_use(player, ctx)
-            can_poison = poison_skill is not None and poison_skill.can_use(player, ctx)
+            witch_role = player.role
+            can_save = witch_role.can_save(player, ctx)
+            can_poison = witch_role.can_poison(player, ctx)
             poison_targets = (
                 [p.seat for p in ctx.get_alive_players() if p.seat != seat] if can_poison else []
             )
@@ -1233,12 +1239,25 @@ class Game:
         self._role_map = {}
         self._night_actions = []
         self._preset_name = ""
+        self._force_night = False
         self.events.log("admin_reset", "管理员重置游戏")
         # 通知所有客户端清除动作面板、恢复初始态
         for seat in self.cm.get_connected_seats():
             await self.cm.send_to_seat(seat, {"type": "action_clear"})
         await self._broadcast_game_state()
         return "游戏已重置"
+
+    async def admin_goto_night(self) -> str:
+        """强制结束当前所有等待并进入下一轮黑夜"""
+        self._force_night = True
+        self.current_action = ""
+        self.current_speaker_seat = None
+        self.voting_candidates = []
+        # 解锁当前所有等待
+        if self._pending_future and not self._pending_future.done():
+            self._pending_future.set_result({})
+        await self._broadcast_game_state()
+        return "已强制进入黑夜"
 
     def admin_rollback(self, event_id: int) -> str:
         removed = self.events.truncate_after(event_id)
