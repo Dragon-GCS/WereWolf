@@ -109,6 +109,10 @@ async def _handle_message(ws: WebSocket, msg: dict, game: Game):
                 await manager.send_to_seat(
                     seat, {"type": "your_info", "data": player.to_private_dict()}
                 )
+            # 重连时补发正在等待的操作面板
+            pending_msg = game._pending_seat_messages.get(seat)
+            if pending_msg:
+                await manager.send_to_seat(seat, pending_msg)
             await manager.broadcast({"type": "game_state", "data": game.get_public_state()})
 
     elif msg_type == "action":

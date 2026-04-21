@@ -26,4 +26,3 @@ game_stages:
     actions:
       - speech
       - vote
-        skill: vote

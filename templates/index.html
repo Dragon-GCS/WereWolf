@@ -1052,8 +1052,8 @@
       const alive = myInfo.is_alive !== false;
       document.getElementById('role-name-el').textContent = r.display_name + (alive ? '' : ' （已出局）');
       const teamEl = document.getElementById('role-team-el');
-      teamEl.textContent = r.team === 'werewolf' ? '⚔️ 狼人阵营' : '🏡 好人阵营';
-      teamEl.className = 'role-team ' + (r.team === 'werewolf' ? 'team-wolf' : 'team-good');
+      teamEl.textContent = r.team === '狼人' ? '⚔️ 狼人阵营' : '🏡 好人阵营';
+      teamEl.className = 'role-team ' + (r.team === '狼人' ? 'team-wolf' : 'team-good');
       document.getElementById('skills-el').innerHTML = (r.skills || [])
         .map(s => `<div class="skill-item"><b>${s.display_name}</b><span>${s.description}</span></div>`)
         .join('');

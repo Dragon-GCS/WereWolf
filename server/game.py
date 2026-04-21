@@ -73,6 +73,7 @@ class Game:
         self._pending_future: Optional[asyncio.Future] = None
         self._pending_seats: set = set()
         self._pending_votes: dict[int, int | dict | None] = {}
+        self._pending_seat_messages: dict[int, dict] = {}  # seat → 待重发的操作消息
 
         # 游戏任务
         self._game_task: Optional[asyncio.Task] = None
@@ -162,6 +163,10 @@ class Game:
 
         self.events.log("game_start", f"游戏开始，共 {len(self.players)} 名玩家")
 
+        # 提前切换 phase，避免 _handle_admin 随后广播的 game_state 仍为 waiting
+        # 导致客户端清空刚收到的 your_info
+        self.phase = GamePhase.NIGHT
+
         for player in self.players:
             await self.cm.send_to_seat(
                 player.seat,
@@ -241,23 +246,20 @@ class Game:
         self._pending_seats = set(alive_seats)
         self._pending_votes = {}
 
+        nominate_msg_data = {
+            "skill": "sheriff_nominate",
+            "skill_display": "竞选警长",
+            "message": "请选择：参与竞选警长，或跳过",
+            "valid_targets": [1, 0],
+            "requires_target": True,
+            "can_skip": False,
+            "is_group": False,
+            "options": {"1": "参与竞选", "0": "跳过竞选"},
+        }
         for seat in alive_seats:
-            await self.cm.send_to_seat(
-                seat,
-                {
-                    "type": "action_request",
-                    "data": {
-                        "skill": "sheriff_nominate",
-                        "skill_display": "竞选警长",
-                        "message": "请选择：参与竞选警长，或跳过",
-                        "valid_targets": [1, 0],
-                        "requires_target": True,
-                        "can_skip": False,
-                        "is_group": False,
-                        "options": {"1": "参与竞选", "0": "跳过竞选"},
-                    },
-                },
-            )
+            msg_data = {"type": "action_request", "data": nominate_msg_data}
+            self._pending_seat_messages[seat] = msg_data
+            await self.cm.send_to_seat(seat, msg_data)
 
         with suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._pending_future, timeout=120.0)
@@ -268,6 +270,7 @@ class Game:
         self._pending_votes = {}
 
         for seat in alive_seats:
+            self._pending_seat_messages.pop(seat, None)
             await self.cm.send_to_seat(seat, {"type": "action_clear"})
 
         if not nominees:
@@ -594,6 +597,9 @@ class Game:
                     "player_died", f"{seat} 号 {player.nickname} 夜晚死亡", {"seat": seat}
                 )
 
+        # 记录毒死名单，用于区分死亡原因（毒死不触发猎人等技能）
+        poison_seat = self.night_state.poison_target
+
         if deaths:
             names = "、".join(
                 f"{s} 号 {self.get_player_by_seat(s).nickname}"
@@ -609,7 +615,8 @@ class Game:
                 )
             for s in deaths:
                 await self._run_badge_transfer(s)
-                await self._handle_on_death(s, cause="night_kill")
+                cause = "poison" if s == poison_seat else "night_kill"
+                await self._handle_on_death(s, cause=cause)
         else:
             await self._broadcast_notification("昨夜平安，没有玩家死亡")
 
@@ -688,6 +695,9 @@ class Game:
 
         await self._run_vote()
 
+        if self._force_night:
+            return False
+
         winner = self._check_win()
         if winner:
             await self._end_game(winner)
@@ -704,6 +714,11 @@ class Game:
         votes = await self._request_vote(
             [p.seat for p in eligible_voters], candidates, timeout=120.0
         )
+
+        # 强制入夜时跳过结算
+        if self._force_night:
+            self.voting_candidates = []
+            return None
 
         tally = defaultdict(float)
         for voter_seat, target_seat in votes.items():
@@ -786,22 +801,21 @@ class Game:
         self._pending_seats = {dying_seat}
         self._pending_votes = {}
 
-        await self.cm.send_to_seat(
-            dying_seat,
-            {
-                "type": "action_request",
-                "data": {
-                    "skill": "sheriff_badge_transfer",
-                    "skill_display": "移交/销毁警徽",
-                    "message": "你是警长，请选择移交警徽给某位玩家，或选择0销毁警徽",
-                    "valid_targets": [0, *alive_others],
-                    "requires_target": True,
-                    "can_skip": False,
-                    "is_group": False,
-                    "options": {"0": "销毁警徽"},
-                },
+        badge_msg = {
+            "type": "action_request",
+            "data": {
+                "skill": "sheriff_badge_transfer",
+                "skill_display": "移交/销毁警徽",
+                "message": "你是警长，请选择移交警徽给某位玩家，或选择0销毁警徽",
+                "valid_targets": [0, *alive_others],
+                "requires_target": True,
+                "can_skip": False,
+                "is_group": False,
+                "options": {"0": "销毁警徽"},
             },
-        )
+        }
+        self._pending_seat_messages[dying_seat] = badge_msg
+        await self.cm.send_to_seat(dying_seat, badge_msg)
 
         try:
             await asyncio.wait_for(self._pending_future, timeout=60.0)
@@ -812,6 +826,7 @@ class Game:
         self._pending_future = None
         self._pending_seats = set()
         self._pending_votes = {}
+        self._pending_seat_messages.pop(dying_seat, None)
         await self.cm.send_to_seat(dying_seat, {"type": "action_clear"})
 
         for p in self.players:
@@ -844,10 +859,15 @@ class Game:
         ctx = self._make_ctx()
         role = player.role
 
-        # 根据死因过滤可触发的阶段
+        # 根据死因过滤可触发的阶段；毒死不触发任何死亡技能
         _night_phases = {RolePhase.ON_NIGHT_KILL, RolePhase.ON_DEATH}
         _vote_phases = {RolePhase.ON_VOTE_OUT, RolePhase.ON_DEATH}
-        allowed = _night_phases if cause == "night_kill" else _vote_phases
+        if cause == "poison":
+            allowed = set()
+        elif cause == "night_kill":
+            allowed = _night_phases
+        else:
+            allowed = _vote_phases
         if role.phase not in allowed or not role.can_use(player, ctx):
             return
 
@@ -921,21 +941,20 @@ class Game:
         for seat in seats:
             player = self.get_player_by_seat(seat)
             valid_targets = role.get_valid_targets(player, ctx) if player else []
-            await self.cm.send_to_seat(
-                seat,
-                {
-                    "type": "action_request",
-                    "data": {
-                        "skill": role.name,
-                        "skill_display": role.display_name,
-                        "message": message or f"请行动：{role.display_name}",
-                        "valid_targets": valid_targets,
-                        "requires_target": role.requires_target(),
-                        "can_skip": role.can_skip(),
-                        "is_group": len(seats) > 1,
-                    },
+            msg_data = {
+                "type": "action_request",
+                "data": {
+                    "skill": role.name,
+                    "skill_display": role.display_name,
+                    "message": message or f"请行动：{role.display_name}",
+                    "valid_targets": valid_targets,
+                    "requires_target": role.requires_target(),
+                    "can_skip": role.can_skip(),
+                    "is_group": len(seats) > 1,
                 },
-            )
+            }
+            self._pending_seat_messages[seat] = msg_data
+            await self.cm.send_to_seat(seat, msg_data)
 
         try:
             await asyncio.wait_for(self._pending_future, timeout=timeout)
@@ -948,6 +967,7 @@ class Game:
         self._pending_votes = {}
 
         for seat in seats:
+            self._pending_seat_messages.pop(seat, None)
             await self.cm.send_to_seat(seat, {"type": "action_clear"})
 
         return result
@@ -971,18 +991,17 @@ class Game:
             poison_targets = (
                 [p.seat for p in ctx.get_alive_players() if p.seat != seat] if can_poison else []
             )
-            await self.cm.send_to_seat(
-                seat,
-                {
-                    "type": "witch_request",
-                    "data": {
-                        "kill_target": kill_target,
-                        "can_save": can_save,
-                        "can_poison": can_poison,
-                        "poison_targets": poison_targets,
-                    },
+            msg_data = {
+                "type": "witch_request",
+                "data": {
+                    "kill_target": kill_target,
+                    "can_save": can_save,
+                    "can_poison": can_poison,
+                    "poison_targets": poison_targets,
                 },
-            )
+            }
+            self._pending_seat_messages[seat] = msg_data
+            await self.cm.send_to_seat(seat, msg_data)
 
         try:
             await asyncio.wait_for(self._pending_future, timeout=timeout)
@@ -995,6 +1014,7 @@ class Game:
         self._pending_votes = {}
 
         for seat in seats:
+            self._pending_seat_messages.pop(seat, None)
             await self.cm.send_to_seat(seat, {"type": "action_clear"})
 
         return result
@@ -1007,16 +1027,15 @@ class Game:
         self._pending_votes = {}
 
         for seat in voter_seats:
-            await self.cm.send_to_seat(
-                seat,
-                {
-                    "type": "vote_request",
-                    "data": {
-                        "message": "请投票（选择要淘汰的玩家，0 表示弃票）",
-                        "candidates": candidates,
-                    },
+            msg_data = {
+                "type": "vote_request",
+                "data": {
+                    "message": "请投票（选择要淘汰的玩家，0 表示弃票）",
+                    "candidates": candidates,
                 },
-            )
+            }
+            self._pending_seat_messages[seat] = msg_data
+            await self.cm.send_to_seat(seat, msg_data)
 
         try:
             await asyncio.wait_for(self._pending_future, timeout=timeout)
@@ -1031,6 +1050,7 @@ class Game:
         self._pending_votes = {}
 
         for seat in voter_seats:
+            self._pending_seat_messages.pop(seat, None)
             await self.cm.send_to_seat(seat, {"type": "action_clear"})
 
         return result
@@ -1043,14 +1063,17 @@ class Game:
         self._pending_seats = {seat}
         self._pending_votes = {}
 
-        await self.cm.send_to_seat(
-            seat,
-            {"type": "speech_turn", "data": {"message": "请发言，发言结束后点击「发言结束」"}},
-        )
+        msg_data = {
+            "type": "speech_turn",
+            "data": {"message": "请发言，发言结束后点击「发言结束」"},
+        }
+        self._pending_seat_messages[seat] = msg_data
+        await self.cm.send_to_seat(seat, msg_data)
 
         with suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._pending_future, timeout=timeout)
 
+        self._pending_seat_messages.pop(seat, None)
         self._pending_future = None
         self._pending_seats = set()
         self._pending_votes = {}
@@ -1063,22 +1086,21 @@ class Game:
         self._pending_seats = {sheriff.seat}
         self._pending_votes = {}
 
-        await self.cm.send_to_seat(
-            sheriff.seat,
-            {
-                "type": "action_request",
-                "data": {
-                    "skill": "sheriff_direction",
-                    "skill_display": "警长指定发言顺序",
-                    "message": "请选择发言方向",
-                    "valid_targets": [1, 2],
-                    "requires_target": True,
-                    "can_skip": False,
-                    "is_group": False,
-                    "options": {"1": "右手发言", "2": "左手发言"},
-                },
+        direction_msg = {
+            "type": "action_request",
+            "data": {
+                "skill": "sheriff_direction",
+                "skill_display": "警长指定发言顺序",
+                "message": "请选择发言方向",
+                "valid_targets": [1, 2],
+                "requires_target": True,
+                "can_skip": False,
+                "is_group": False,
+                "options": {"1": "右手发言", "2": "左手发言"},
             },
-        )
+        }
+        self._pending_seat_messages[sheriff.seat] = direction_msg
+        await self.cm.send_to_seat(sheriff.seat, direction_msg)
 
         try:
             await asyncio.wait_for(self._pending_future, timeout=timeout)
@@ -1089,7 +1111,7 @@ class Game:
         self._pending_future = None
         self._pending_seats = set()
         self._pending_votes = {}
-
+        self._pending_seat_messages.pop(sheriff.seat, None)
         await self.cm.send_to_seat(sheriff.seat, {"type": "action_clear"})
         return result if result in (1, 2) else 1
 
@@ -1240,6 +1262,7 @@ class Game:
         self._night_actions = []
         self._preset_name = ""
         self._force_night = False
+        self._pending_seat_messages = {}
         self.events.log("admin_reset", "管理员重置游戏")
         # 通知所有客户端清除动作面板、恢复初始态
         for seat in self.cm.get_connected_seats():
