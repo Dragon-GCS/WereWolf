@@ -6,13 +6,15 @@ import random
 from collections import Counter, defaultdict
 from contextlib import suppress
 from enum import Enum
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, Callable, ClassVar, Optional
 
-from server.messages import GameStateData, SeerResultItem, SeerResultsData
+from server.messages import GameStateData, SeerResultItem
 
 from .events import EventLog
 from .player import Player
 from .roles import (
+    KnightRole,
+    MechWolfRole,
     NightState,
     Role,
     RoleContext,
@@ -84,6 +86,9 @@ class Game:
         # 上帝面板强制进入黑夜标志
         self._force_night: bool = False
 
+        # 骑士决斗等待处理队列 {seat: knight_seat, target: target_seat}
+        self._pending_knight_duel: Optional[dict] = None
+
     # ──────────────────────────── 配置加载 ────────────────────────────
 
     def load_config(self, config: dict) -> None:
@@ -95,6 +100,15 @@ class Game:
             if stage["name"] == "夜晚":
                 # actions 现在是纯角色名字符串列表
                 self._night_actions = [a for a in stage.get("actions", []) if isinstance(a, str)]
+
+        # 若夜晚行动引用了"狼人"但角色表中无此条目（配置中无标准狼人），从全局 roles.yml 补充
+        # 确保狼人击杀阶段可以获取到音频/消息配置
+        if "狼人" in self._night_actions and "狼人" not in self._role_map:
+            from .config import _load_role_map as _global_load
+
+            global_map = _global_load()
+            if "狼人" in global_map:
+                self._role_map["狼人"] = global_map["狼人"]
 
     # ──────────────────────────── 玩家管理 ────────────────────────────
 
@@ -160,6 +174,9 @@ class Game:
             player.is_alive = True
             player.can_vote = True
             player.is_sheriff = False
+            player.vampire_converted = False
+            player.vampire_conversion_round = 0
+            player.team_override = None
 
         self.events.log("game_start", f"游戏开始，共 {len(self.players)} 名玩家")
 
@@ -279,6 +296,23 @@ class Game:
             await self._broadcast_game_state()
             return
 
+        # ── 只有一人竞选：直接授予警徽 ──────────────────────────────
+        if len(nominees) == 1:
+            sheriff_seat = nominees[0]
+            sheriff = self.get_player_by_seat(sheriff_seat)
+            if sheriff:
+                sheriff.is_sheriff = True
+                self.events.log(
+                    "sheriff_elected", f"{sheriff_seat} 号 {sheriff.nickname} 无竞争当选警长"
+                )
+                await self._broadcast_notification(
+                    f"只有 {sheriff_seat} 号 {sheriff.nickname} 一人竞选，直接当选警长！",
+                    audio=[self._seat_audio(sheriff_seat), "当选警长.mp3"],
+                )
+            await self._broadcast_game_state()
+            await self._broadcast_your_info()
+            return
+
         nominee_names = "、".join(
             f"{s} 号 {self.get_player_by_seat(s).nickname}" for s in sorted(nominees)
         )
@@ -300,7 +334,7 @@ class Game:
             self.current_action = f"竞选警长 · {seat} 号 {player.nickname} 发言"
             await self._broadcast_game_state()
             self.events.log("speech_start", f"{seat} 号 {player.nickname} 竞选发言", {"seat": seat})
-            await self._wait_speech_end(seat, timeout=180)
+            await self._wait_speech_end(seat, timeout=600)
 
         self.current_speaker_seat = None
 
@@ -313,38 +347,22 @@ class Game:
         await self._broadcast_game_state()
 
         eligible_voters = [p.seat for p in self.get_alive_players() if p.seat not in nominees]
-        votes = await self._request_vote(eligible_voters, nominees, timeout=120.0)
-        self.voting_candidates = []
-
-        tally: dict[int, float] = {}
-        for _voter, target in votes.items():
-            if isinstance(target, int) and target in nominees:
-                tally[target] = tally.get(target, 0) + 1
-
-        if not tally:
-            self.events.log("sheriff_no_vote", "无人投票，无警长")
-            await self._broadcast_notification("无人投票，本局无警长")
-            await self._broadcast_game_state()
+        sheriff_seat = await self._run_counted_vote(
+            voter_seats=eligible_voters,
+            candidates=nominees,
+            re_voters_fn=lambda top: [
+                p.seat for p in self.get_alive_players() if p.seat not in top
+            ],
+            tie_log_event="sheriff_tie",
+            no_votes_msg="无人投票，本局无警长",
+            re_vote_msg_fn=lambda tied_names: f"请重新投票（候选：{tied_names}）",
+            re_vote_action="竞选警长 · 再次投票",
+            tie_speech_action_fn=lambda seat, name: f"竞选警长 · {seat} 号 {name} 再次发言",
+        )
+        if sheriff_seat is None:
+            if not self._force_night:
+                self.events.log("sheriff_no_vote", "无人投票，无警长")
             return
-
-        tally_strs = [
-            f"{s}号({self.get_player_by_seat(s).nickname}){int(v)}票"
-            for s, v in sorted(tally.items())
-        ]
-        await self._broadcast_notification("票型：" + "，".join(tally_strs))
-
-        max_votes = max(tally.values())
-        top = [s for s, v in tally.items() if v == max_votes]
-
-        if len(top) > 1:
-            await self._broadcast_notification(
-                f"平票！{' 和 '.join(str(s) + '号' for s in top)} 均无效，本局无警长"
-            )
-            self.events.log("sheriff_tie", f"警长平票：{top}")
-            await self._broadcast_game_state()
-            return
-
-        sheriff_seat = top[0]
         sheriff = self.get_player_by_seat(sheriff_seat)
         if sheriff:
             sheriff.is_sheriff = True
@@ -374,7 +392,14 @@ class Game:
         for role_name in self._night_actions:
             # 先取得角色实例，再用 isinstance 判断类型（防止硬编码角色名）
             role_players = self._get_role_players(role_name)
-            role = role_players[0][1] if role_players else self._get_role_template(role_name)
+            # 狼人击杀阶段：始终使用标准狼人模板作为 role，避免 join_wolf_kill 玩家
+            # （吸血鬼/黑狼王）排在首位时将轮次错误替换为其特殊行动
+            if role_name == "狼人":
+                role = self._get_role_template("狼人") or (
+                    role_players[0][1] if role_players else None
+                )
+            else:
+                role = role_players[0][1] if role_players else self._get_role_template(role_name)
 
             if isinstance(role, WitchRole):
                 await self._run_witch_night()
@@ -386,15 +411,38 @@ class Game:
                     await self._broadcast_role_phase(role, has_players=False)
                 continue
 
+            if role is None:
+                continue
+
             await self._run_role_action(role_players, role)
 
     def _get_role_players(self, role_name: str) -> list[tuple[Player, Role]]:
         """找出拥有指定角色的所有玩家（含死亡，死亡时也要广播睁眼/闭眼）"""
-        return [
+        players = [
             (player, player.role)
             for player in self.players
             if player.role and player.role.name == role_name
         ]
+        if role_name == "狼人":
+            players += [(p, p.role) for p in self.players if p.role and p.role.join_wolf_kill]
+            # 末狼时：机械狼、石像鬼、被转化玩家加入狼人击杀轮
+            # 判断"末狼"：当前存活的狼人阵营中只剩某玩家自己
+            for p in self.players:
+                if not p.is_alive or not p.role:
+                    continue
+                if p.role.join_wolf_kill:
+                    continue  # 已被上面的 join_wolf_kill 规则包含
+                if p.role.name not in ("机械狼", "石像鬼") and not p.vampire_converted:
+                    continue
+                if p.team != "狼人":
+                    continue
+                # 检查是否是唯一存活的狼人阵营玩家
+                other_wolves = [
+                    q for q in self.get_alive_players() if q.seat != p.seat and q.team == "狼人"
+                ]
+                if not other_wolves and (p, p.role) not in players:
+                    players.append((p, p.role))
+        return players
 
     def _get_role_template(self, role_name: str) -> Optional[Role]:
         """从角色配置中构建一个临时 Role 实例，用于获取音频/消息配置"""
@@ -423,7 +471,25 @@ class Game:
     async def _run_role_action(self, role_players: list[tuple[Player, Role]], role: Role):
         """执行一组同角色的夜晚行动"""
         ctx = self._make_ctx()
-        able_players = [p for p, r in role_players if p.is_alive and r.can_use(p, ctx)]
+        # 狼人击杀阶段：所有存活的 join_wolf_kill 玩家均可参与，无视 can_use
+        # 吸血鬼在自己的"吸血鬼"轮次时，第二轮起 can_use=False，应尊重该判断
+        if role.name == "狼人":
+            able_players = [p for p, r in role_players if p.is_alive]
+        else:
+            # 末狼转化者（被吸血鬼转化后成为唯一狼人阵营）失去原技能，只参与狼人击杀
+            able_players = [
+                p
+                for p, r in role_players
+                if p.is_alive
+                and r.can_use(p, ctx)
+                and not (
+                    p.vampire_converted
+                    and p.team == "狼人"
+                    and not any(
+                        q for q in ctx.get_alive_players() if q.seat != p.seat and q.team == "狼人"
+                    )
+                )
+            ]
 
         # 广播睁眼
         await self._broadcast_role_phase(role, has_players=bool(able_players))
@@ -460,19 +526,7 @@ class Game:
                         result.message,
                         {"role": role.name, "seat": seat, "target": target},
                     )
-                    if role.name == "预言家" and result.success and target is not None:
-                        target_p = ctx.get_player_by_seat(target)
-                        if target_p:
-                            self.seer_results.setdefault(seat, []).append(
-                                {"seat": target, "camp": target_p.team}
-                            )
-                            await self.cm.send_to_seat(
-                                seat,
-                                {
-                                    "type": "seer_results",
-                                    "data": {"results": self.seer_results[seat]},
-                                },
-                            )
+                    await self._handle_role_result(seat, target, result, ctx)
                     await self.cm.send_to_seat(
                         seat,
                         {
@@ -487,6 +541,72 @@ class Game:
             self.events.log("night_action", role.close_msg)
             await self._broadcast_notification(role.close_msg, audio=role.close_audio, wait=True)
             await self._broadcast_game_state()
+
+    async def _handle_role_result(
+        self,
+        actor_seat: int,
+        target_seat: Optional[int],
+        result,
+        ctx: RoleContext,
+    ) -> None:
+        """根据 ActionResult.result_type 执行额外的结果处理（存档查验记录并私信玩家）"""
+
+        if not result.success or target_seat is None:
+            return
+
+        if result.result_type == "seer":
+            camp = result._extra.get("camp", "好人")
+            self.seer_results.setdefault(actor_seat, []).append(
+                {"seat": target_seat, "camp": camp, "role_display": None, "extra_info": None}
+            )
+            await self.cm.send_to_seat(
+                actor_seat,
+                {"type": "seer_results", "data": {"results": self.seer_results[actor_seat]}},
+            )
+
+        elif result.result_type == "mirror":
+            extra = result._extra
+            role_display = extra.get("role_display", "")
+            extra_info = extra.get("extra_info")
+            camp = extra.get("camp", "好人")
+            self.seer_results.setdefault(actor_seat, []).append(
+                {
+                    "seat": target_seat,
+                    "camp": camp,
+                    "role_display": role_display,
+                    "extra_info": extra_info,
+                }
+            )
+            await self.cm.send_to_seat(
+                actor_seat,
+                {"type": "seer_results", "data": {"results": self.seer_results[actor_seat]}},
+            )
+
+        elif result.result_type == "gargoyle":
+            extra = result._extra
+            role_display = extra.get("role_display", "")
+            camp = extra.get("camp", "好人")
+            self.seer_results.setdefault(actor_seat, []).append(
+                {
+                    "seat": target_seat,
+                    "camp": camp,
+                    "role_display": role_display,
+                    "extra_info": None,
+                }
+            )
+            await self.cm.send_to_seat(
+                actor_seat,
+                {"type": "seer_results", "data": {"results": self.seer_results[actor_seat]}},
+            )
+
+        elif result.result_type == "vampire_convert":
+            # 向被转化玩家即刻推送 your_info，使其前端立即显示转化标记
+            converted = self.get_player_by_seat(target_seat)
+            if converted:
+                await self.cm.send_to_seat(
+                    target_seat,
+                    {"type": "your_info", "data": converted.to_private_dict()},
+                )
 
     async def _run_witch_night(self):
         """女巫夜晚：解药+毒药合并为一次交互"""
@@ -578,9 +698,18 @@ class Game:
 
         kill = self.night_state.kill_target
         if kill is not None:
-            if kill == self.night_state.saved:
+            saved = self.night_state.saved
+            protected = self.night_state.protected
+            ignore_guard = self.night_state.ignore_guard
+            if kill == saved and kill == protected and not ignore_guard:
+                # 女巫解药与守卫守护同时作用于同一目标 → 相互抵消，目标死亡
+                self.events.log(
+                    "night_double_protect", f"{kill} 号解药与守卫同时生效，相互抵消，目标死亡"
+                )
+                deaths.append(kill)
+            elif kill == saved:
                 self.events.log("night_save", f"{kill} 号被解药救活")
-            elif kill == self.night_state.protected:
+            elif kill == protected and not ignore_guard:
                 self.events.log("night_protect", f"{kill} 号被守卫保护")
             else:
                 deaths.append(kill)
@@ -680,7 +809,15 @@ class Game:
                 f"{player.seat} 号 {player.nickname} 开始发言",
                 {"seat": player.seat},
             )
-            await self._wait_speech_end(player.seat, timeout=180)
+            await self._wait_speech_end(player.seat, timeout=600)
+
+            # 发言结束后检查骑士决斗
+            if self._pending_knight_duel:
+                game_over = await self._process_knight_duel()
+                if game_over:
+                    return True
+                if self._force_night:
+                    break
 
         self.current_speaker_seat = None
         if self._check_force_night():
@@ -709,51 +846,19 @@ class Game:
     async def _run_vote(self) -> Optional[int]:
         eligible_voters = [p for p in self.get_alive_players() if p.can_vote]
         candidates = [p.seat for p in self.get_alive_players()]
-        self.voting_candidates = candidates
 
-        votes = await self._request_vote(
-            [p.seat for p in eligible_voters], candidates, timeout=120.0
+        loser_seat = await self._run_counted_vote(
+            voter_seats=[p.seat for p in eligible_voters],
+            candidates=candidates,
+            re_voters_fn=lambda _top: [p.seat for p in self.get_alive_players() if p.can_vote],
+            tie_log_event="vote_tie",
+            no_votes_msg="本轮无人被淘汰（无有效票）",
+            re_vote_msg_fn=lambda _: "请重新投票（仅在平票方中选择）",
+            re_vote_action="白天投票 · 再次投票",
+            tie_speech_action_fn=lambda seat, name: f"{seat} 号 {name} 再次发言",
         )
-
-        # 强制入夜时跳过结算
-        if self._force_night:
-            self.voting_candidates = []
+        if loser_seat is None:
             return None
-
-        tally = defaultdict(float)
-        for voter_seat, target_seat in votes.items():
-            if target_seat and target_seat in candidates:
-                voter = self.get_player_by_seat(voter_seat)
-                weight = 1.5 if voter and voter.is_sheriff else 1
-                tally[target_seat] += weight
-
-        self.voting_candidates = []
-
-        if tally:
-            tally_strs = []
-            for s in sorted(tally.keys()):
-                p = self.get_player_by_seat(s)
-                name = p.nickname if p else "?"
-                v = tally[s]
-                tally_strs.append(
-                    f"{s}号({name}){v:.0f}票" if v == int(v) else f"{s}号({name}){v}票"
-                )
-            await self._broadcast_notification("票型：" + "，".join(tally_strs))
-        else:
-            await self._broadcast_notification("本轮无人被淘汰（无有效票）")
-            return None
-
-        max_votes = max(tally.values())
-        top = [s for s, v in tally.items() if v == max_votes]
-
-        if len(top) > 1:
-            await self._broadcast_notification(
-                f"平票！{' 和 '.join(str(s) + '号' for s in top)} 均无效，本轮无人出局"
-            )
-            self.events.log("vote_tie", f"平票：{top}")
-            return None
-
-        loser_seat = top[0]
         loser = self.get_player_by_seat(loser_seat)
         if loser:
             loser.is_alive = False
@@ -769,6 +874,7 @@ class Game:
             )
             await self._broadcast_game_state()
             await self._run_badge_transfer(loser_seat)
+            await self._notify_gravedigger(loser_seat)
             await self._handle_on_death(loser_seat, cause="vote")
             # 白痴翻牌后 is_alive=True，跳过遗言
             if not self._check_win() and not loser.is_alive:
@@ -785,7 +891,7 @@ class Game:
             f"{seat} 号 {player.nickname} 请发表遗言", audio="发表遗言.mp3"
         )
         await self._broadcast_game_state()
-        await self._wait_speech_end(seat, timeout=120)
+        await self._wait_speech_end(seat, timeout=600)
         self.current_speaker_seat = None
 
     # ──────────────────────────── 警徽移交 ────────────────────────────
@@ -868,6 +974,37 @@ class Game:
             allowed = _night_phases
         else:
             allowed = _vote_phases
+
+        # 机械狼：如果学到的技能有 on_death 阶段，则用 learned_role 执行
+        if isinstance(role, MechWolfRole) and role.learned_role is not None:
+            learned = role.learned_role
+            if learned.phase in allowed and learned.can_use(player, ctx):
+                trigger_audio = learned.open_audio
+                await self._broadcast_notification(
+                    f"{seat} 号 {player.nickname} 触发习得技能：{learned.display_name}",
+                    audio=trigger_audio,
+                )
+                results = await self._request_action([seat], learned, message="请选择目标")
+                target = results.get(seat)
+                if isinstance(target, int):
+                    ctx = self._make_ctx()
+                    result = learned.execute(player, target, ctx)
+                    await self._broadcast_notification(result.message)
+                    await self._broadcast_game_state()
+                    for s in result.affected_seats:
+                        killed = self.get_player_by_seat(s)
+                        if killed and killed.is_alive:
+                            killed.is_alive = False
+                            self.events.log(
+                                "player_died", f"{s} 号 {killed.nickname} 被技能击杀", {"seat": s}
+                            )
+                            await self._run_badge_transfer(s)
+                            await self._notify_gravedigger(s)
+                            await self._handle_on_death(s, cause=cause)
+                            if not self._check_win() and not killed.is_alive:
+                                await self._run_last_words(s)
+            return
+
         if role.phase not in allowed or not role.can_use(player, ctx):
             return
 
@@ -883,7 +1020,7 @@ class Game:
             f"{seat} 号 {player.nickname} 触发技能：{role.display_name}",
             audio=trigger_audio,
         )
-        results = await self._request_action([seat], role, message="请选择目标", timeout=60.0)
+        results = await self._request_action([seat], role, message="请选择目标")
         target = results.get(seat)
         if isinstance(target, int):
             ctx = self._make_ctx()
@@ -898,7 +1035,10 @@ class Game:
                         "player_died", f"{s} 号 {killed.nickname} 被技能击杀", {"seat": s}
                     )
                     await self._run_badge_transfer(s)
+                    await self._notify_gravedigger(s)
                     await self._handle_on_death(s, cause=cause)
+                    if not self._check_win() and not killed.is_alive:
+                        await self._run_last_words(s)
 
     # ──────────────────────────── 胜负判断 ────────────────────────────
 
@@ -923,6 +1063,127 @@ class Game:
         )
         await self._broadcast_game_state(reveal_roles=True)
 
+    # ──────────────────────────── 守墓人通知 ────────────────────────────
+
+    async def _notify_gravedigger(self, eliminated_seat: int) -> None:
+        """向所有活着的守墓人私信白天出局玩家的角色，并更新其查验面板"""
+        eliminated = self.get_player_by_seat(eliminated_seat)
+        if not eliminated or not eliminated.role:
+            return
+        role_name = eliminated.role.display_name
+        camp = "狼人" if eliminated.team == "狼人" else "好人"
+        gravediggers = [p for p in self.get_alive_players() if p.role and p.role.name == "守墓人"]
+        for gd in gravediggers:
+            # Toast 提示（只显示阵营，不暴露具体角色名）
+            await self.cm.send_to_seat(
+                gd.seat,
+                {
+                    "type": "action_result",
+                    "data": {
+                        "message": f"守墓人获知：{eliminated_seat} 号 {eliminated.nickname} 是【{camp}阵营】",
+                        "success": True,
+                    },
+                },
+            )
+            # 持久化到查验面板：role_display 设为 None，前端显示阵营标签
+            self.seer_results.setdefault(gd.seat, []).append(
+                {
+                    "seat": eliminated_seat,
+                    "camp": camp,
+                    "role_display": None,
+                    "extra_info": None,
+                }
+            )
+            await self.cm.send_to_seat(
+                gd.seat,
+                {"type": "seer_results", "data": {"results": self.seer_results[gd.seat]}},
+            )
+
+    # ──────────────────────────── 骑士决斗 ────────────────────────────
+
+    def queue_knight_duel(self, knight_seat: int, target_seat: int) -> bool:
+        """骑士请求决斗（同步），返回 True 表示成功入队。由 app.py 调用。"""
+        player = self.get_player_by_seat(knight_seat)
+        if not player or not player.is_alive:
+            return False
+        if not player.role or player.role.name != "骑士":
+            return False
+        if not isinstance(player.role, KnightRole):
+            return False
+        ctx = self._make_ctx()
+        if not player.role.can_use(player, ctx):
+            return False
+        target = self.get_player_by_seat(target_seat)
+        if not target or not target.is_alive:
+            return False
+
+        self._pending_knight_duel = {"knight_seat": knight_seat, "target_seat": target_seat}
+        # 如果骑士正在发言，强制结束发言以触发决斗处理
+        if self.current_speaker_seat == knight_seat:
+            self.submit_speech_end(knight_seat)
+        return True
+
+    async def _process_knight_duel(self) -> bool:
+        """处理骑士决斗。返回 True 表示游戏已结束。"""
+        if self._pending_knight_duel is None:
+            return False
+        knight_seat = self._pending_knight_duel["knight_seat"]
+        target_seat = self._pending_knight_duel["target_seat"]
+        self._pending_knight_duel = None
+
+        knight = self.get_player_by_seat(knight_seat)
+        target = self.get_player_by_seat(target_seat)
+        if not knight or not knight.is_alive or not knight.role:
+            return False
+        if not target or not target.is_alive:
+            return False
+        if not isinstance(knight.role, KnightRole):
+            return False
+
+        ctx = self._make_ctx()
+        result = knight.role.execute(knight, target_seat, ctx)
+        await self._broadcast_notification(result.message, audio=None)
+        self.events.log(
+            "role_action",
+            result.message,
+            {"role": "骑士", "seat": knight_seat, "target": target_seat},
+        )
+
+        if result.result_type == "knight_win":
+            # 狼人死亡，进入黑夜
+            target.is_alive = False
+            self.events.log(
+                "player_died",
+                f"{target_seat} 号 {target.nickname} 被骑士决斗击杀",
+                {"seat": target_seat},
+            )
+            await self._broadcast_game_state()
+            winner = self._check_win()
+            if winner:
+                await self._end_game(winner)
+                return True
+            # 强制进入黑夜
+            self._force_night = True
+            return False
+
+        elif result.result_type == "knight_lose":
+            # 骑士自己死亡，游戏继续
+            knight.is_alive = False
+            self.events.log(
+                "player_died",
+                f"{knight_seat} 号 {knight.nickname} 骑士决斗失败身亡",
+                {"seat": knight_seat},
+            )
+            await self._run_badge_transfer(knight_seat)
+            await self._broadcast_game_state()
+            winner = self._check_win()
+            if winner:
+                await self._end_game(winner)
+                return True
+            return False
+
+        return False
+
     # ──────────────────────────── 动作收集 ────────────────────────────
 
     async def _request_action(
@@ -930,7 +1191,7 @@ class Game:
         seats: list[int],
         role: Role,
         message: str = "",
-        timeout: float = 120.0,
+        timeout: float = 600.0,
     ) -> dict[int, Optional[int]]:
         ctx = self._make_ctx()
 
@@ -1054,6 +1315,126 @@ class Game:
             await self.cm.send_to_seat(seat, {"type": "action_clear"})
 
         return result
+
+    async def _broadcast_vote_details(
+        self,
+        votes: dict[int, int | dict | None],
+        candidates: list[int],
+        tally: dict[int, float],
+    ) -> None:
+        """广播详细票型（谁投给谁）和票数汇总。"""
+        target_to_voters: dict[int, list[int]] = defaultdict(list)
+        abstains: list[int] = []
+        for voter_seat, target_seat in votes.items():
+            if isinstance(target_seat, int) and target_seat in candidates:
+                target_to_voters[target_seat].append(voter_seat)
+            else:
+                abstains.append(voter_seat)
+        detail_parts = []
+        for t in sorted(target_to_voters.keys()):
+            voters = sorted(target_to_voters[t])
+            tp = self.get_player_by_seat(t)
+            tname = tp.nickname if tp else "?"
+            detail_parts.append(f"{','.join(str(v) for v in voters)} → {t}号({tname})")
+        if abstains:
+            detail_parts.append(f"{','.join(str(v) for v in sorted(abstains))} → 弃票")
+        if detail_parts:
+            await self._broadcast_notification("投票详情：\n" + "\n".join(detail_parts))
+        tally_strs = []
+        for s in sorted(tally.keys()):
+            p = self.get_player_by_seat(s)
+            name = p.nickname if p else "?"
+            v = tally[s]
+            tally_strs.append(f"{s}号({name}){v:.0f}票" if v == int(v) else f"{s}号({name}){v}票")
+        await self._broadcast_notification("票型：" + "，".join(tally_strs))
+
+    async def _run_counted_vote(
+        self,
+        voter_seats: list[int],
+        candidates: list[int],
+        re_voters_fn: Callable[[list[int]], list[int]],
+        tie_log_event: str,
+        no_votes_msg: str,
+        re_vote_msg_fn: Callable[[str], str],
+        re_vote_action: str,
+        tie_speech_action_fn: Callable[[int, str], str],
+    ) -> Optional[int]:
+        """统一投票流程：收集投票 → 统计 → 广播详情 → 平票循环，返回最终胜者座位或 None。
+
+        票权：警长 1.5 票，其余 1 票（竞选阶段无人是警长，自然全为 1 票）。
+        调用方负责：设置 voting_candidates、广播投票开始通知及 broadcast_game_state。
+        本方法负责：vote 收集、tally 统计、广播详情/票型、平票发言+再投票循环、clearing voting_candidates。
+        返回 None 表示无胜者（无有效票）或强制入夜。
+        """
+        votes = await self._request_vote(voter_seats, candidates, timeout=120.0)
+        self.voting_candidates = []
+
+        if self._force_night:
+            return None
+
+        tally: dict[int, float] = defaultdict(float)
+        for voter_seat, target_seat in votes.items():
+            if isinstance(target_seat, int) and target_seat in candidates:
+                voter = self.get_player_by_seat(voter_seat)
+                tally[target_seat] += 1.5 if voter and voter.is_sheriff else 1.0
+
+        if not tally:
+            await self._broadcast_notification(no_votes_msg)
+            await self._broadcast_game_state()
+            return None
+
+        await self._broadcast_vote_details(votes, candidates, tally)
+        max_votes = max(tally.values())
+        top = [s for s, v in tally.items() if v == max_votes]
+
+        while len(top) > 1:
+            tied_names = "、".join(
+                f"{s}号 {self.get_player_by_seat(s).nickname}" for s in sorted(top)
+            )
+            await self._broadcast_notification(
+                f"平票！{tied_names} 平票，请平票方依次再次发言后重新投票"
+            )
+            self.events.log(tie_log_event, f"平票：{top}，进入再次发言")
+            for seat in top:
+                if self._force_night:
+                    break
+                sp = self.get_player_by_seat(seat)
+                if not sp or not sp.is_alive:
+                    continue
+                self.current_speaker_seat = seat
+                self.current_action = tie_speech_action_fn(seat, sp.nickname)
+                await self._broadcast_game_state()
+                self.events.log(
+                    "speech_start", f"{seat} 号 {sp.nickname} 平票再次发言", {"seat": seat}
+                )
+                await self._wait_speech_end(seat, timeout=600)
+            self.current_speaker_seat = None
+            if self._force_night:
+                self.voting_candidates = []
+                return None
+            self.current_action = re_vote_action
+            self.voting_candidates = top
+            await self._broadcast_notification(re_vote_msg_fn(tied_names), audio="开始投票.mp3")
+            await self._broadcast_game_state()
+            re_voter_seats = re_voters_fn(top)
+            re_votes = await self._request_vote(re_voter_seats, top, timeout=120.0)
+            self.voting_candidates = []
+            if self._force_night:
+                return None
+            tally = defaultdict(float)
+            for voter_seat, target_seat in re_votes.items():
+                if isinstance(target_seat, int) and target_seat in top:
+                    voter = self.get_player_by_seat(voter_seat)
+                    tally[target_seat] += 1.5 if voter and voter.is_sheriff else 1.0
+            if not tally:
+                await self._broadcast_notification(no_votes_msg)
+                await self._broadcast_game_state()
+                return None
+            await self._broadcast_vote_details(re_votes, top, tally)
+            max_votes = max(tally.values())
+            top = [s for s, v in tally.items() if v == max_votes]
+
+        return top[0]
 
     async def _wait_speech_end(self, seat: int, timeout: float = 180.0):
         # 播放 xx号发言音频

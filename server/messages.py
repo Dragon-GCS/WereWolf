@@ -5,13 +5,15 @@ from typing import Literal, Optional, TypedDict
 # ── 子结构 ──────────────────────────────────────────────
 
 
-class RoleDict(TypedDict):
+class RoleDict(TypedDict, total=False):
     name: str
     display_name: str
     team: Literal["狼人", "村民", "神职", "中立"]
     description: str
     phase: Optional[str]
     can_skip: bool
+    dueled: bool            # 骑士：是否已决斗过
+    learned_display: str    # 机械狼：已学习的角色名
 
 
 class PublicPlayerDict(TypedDict):
@@ -34,6 +36,8 @@ class PrivatePlayerDict(TypedDict):
 class SeerResultItem(TypedDict):
     seat: int
     camp: Literal["狼人", "好人"]
+    role_display: Optional[str]  # 灵镜少女/石像鬼专用：具体角色名
+    extra_info: Optional[str]  # 吸血鬼转化信息等额外提示
 
 
 # ── 消息 data 结构 ────────────────────────────────────────
@@ -68,6 +72,7 @@ class YourInfoData(TypedDict):
     is_sheriff: bool
     can_vote: bool
     role: Optional[RoleDict]
+    vampire_converted: bool
 
 
 class ActionRequestData(TypedDict):

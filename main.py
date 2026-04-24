@@ -10,12 +10,15 @@ logging.basicConfig(
 
 
 def main():
+    logger = logging.getLogger(__name__)
+    logger.info("Start Werewolf server: 0.0.0.0:8765")
     uvicorn.run(
         "server.app:app",
         host="0.0.0.0",
         port=8765,
-        reload=False,
-        log_level="info",
+        reload=True,
+        reload_includes=["server/*", "templates/*", "config/"],
+        log_level="error",
     )
 
 

@@ -55,6 +55,22 @@ async def get_events():
     return {"events": get_game().events.get_all()}
 
 
+@app.get("/api/roles")
+async def get_all_roles():
+    """返回所有玩家的角色身份（上帝视角）"""
+    game = get_game()
+    players = [
+        {
+            **p.to_public_dict(),
+            "role_display": p.role.display_name if p.role else None,
+            "team": p.team if p.role else None,
+            "vampire_converted": p.vampire_converted,
+        }
+        for p in sorted(game.players, key=lambda x: x.seat)
+    ]
+    return {"players": players}
+
+
 # ──────────────────────────── WebSocket ────────────────────────────
 
 
@@ -146,6 +162,20 @@ async def _handle_message(ws: WebSocket, msg: dict, game: Game):
         seat = manager.get_seat_by_ws(ws)
         if seat is not None:
             game.submit_speech_end(seat)
+
+    elif msg_type == "knight_duel":
+        seat = manager.get_seat_by_ws(ws)
+        if seat is None:
+            return
+        target = data.get("target")
+        if not isinstance(target, int):
+            await manager.send_to_ws(ws, {"type": "error", "data": {"message": "请指定决斗目标"}})
+            return
+        ok = game.queue_knight_duel(seat, target)
+        if not ok:
+            await manager.send_to_ws(
+                ws, {"type": "error", "data": {"message": "无法发起决斗（已决斗过或非骑士）"}}
+            )
 
     elif msg_type == "audio_done":
         seat = manager.get_seat_by_ws(ws)
