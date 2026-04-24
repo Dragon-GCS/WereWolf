@@ -286,10 +286,7 @@ class SeerRole(Role, role_name="预言家"):
             raise ValueError(msg)
 
         # 吸血鬼转化玩家：第二轮起显示为狼人（覆盖角色本身的伪装）
-        if target.vampire_converted and ctx.round >= 2:
-            camp = "狼人"
-        else:
-            camp = target.role.inspect_camp()
+        camp = "狼人" if target.vampire_converted and ctx.round >= 2 else target.role.inspect_camp()
         return ActionResult(
             True,
             f"{target_seat} 号 {target.nickname} 是【{camp}】",
@@ -554,15 +551,14 @@ class KnightRole(Role, role_name="骑士"):
                 result_type="knight_win",
                 private=False,
             )
-        else:
-            # 决斗对象是好人 → 骑士死亡
-            return ActionResult(
-                True,
-                f"骑士决斗 {target_seat} 号 {target.nickname}！目标是好人，骑士身亡！",
-                affected_seats=[player.seat],
-                result_type="knight_lose",
-                private=False,
-            )
+        # 决斗对象是好人 → 骑士死亡
+        return ActionResult(
+            True,
+            f"骑士决斗 {target_seat} 号 {target.nickname}！目标是好人，骑士身亡！",
+            affected_seats=[player.seat],
+            result_type="knight_lose",
+            private=False,
+        )
 
     def to_dict(self) -> "RoleDict":
         d = super().to_dict()
@@ -591,9 +587,6 @@ class MechWolfRole(Role, role_name="机械狼"):
             # 第一晚：学习技能
             return ctx.round == 1
         # 已学习：检查行动模式
-        other_wolves = [
-            p for p in ctx.get_alive_players() if p.seat != player.seat and p.team == "狼人"
-        ]
         # 有无其他狼均委托给 learned_role；破盾刀（learned_role=None）时末狼由狼人击杀轮处理
         if self.learned_role is not None:
             return self.learned_role.can_use(player, ctx)
@@ -603,9 +596,6 @@ class MechWolfRole(Role, role_name="机械狼"):
         if not self._learned:
             return [p.seat for p in ctx.get_alive_players() if p.seat != player.seat]
 
-        other_wolves = [
-            p for p in ctx.get_alive_players() if p.seat != player.seat and p.team == "狼人"
-        ]
         if self.learned_role is not None:
             if isinstance(self.learned_role, WitchRole):
                 return self.learned_role.get_poison_targets(player, ctx)
@@ -637,7 +627,7 @@ class MechWolfRole(Role, role_name="机械狼"):
                     True,
                     f"机械狼从 {target_seat} 号 {target.nickname} 学习了【{self.learned_display}·毒药】",
                 )
-            elif target.role.team == "狼人":
+            if target.role.team == "狼人":
                 # 狼人：获得破盾刀
                 self.ignore_guard = True
                 self.learned_role = None  # 无需委托，直接刀人（走无他狼逻辑）
@@ -645,13 +635,12 @@ class MechWolfRole(Role, role_name="机械狼"):
                     True,
                     f"机械狼从 {target_seat} 号 {target.nickname} 学习了【破盾刀】，可无视守卫保护",
                 )
-            else:
-                # 普通角色：深拷贝，避免与原玩家共享内部状态（如守卫的 _last_protected）
-                self.learned_role = copy.deepcopy(target.role)
-                return ActionResult(
-                    True,
-                    f"机械狼从 {target_seat} 号 {target.nickname} 学习了【{self.learned_display}】技能",
-                )
+            # 普通角色：深拷贝，避免与原玩家共享内部状态（如守卫的 _last_protected）
+            self.learned_role = copy.deepcopy(target.role)
+            return ActionResult(
+                True,
+                f"机械狼从 {target_seat} 号 {target.nickname} 学习了【{self.learned_display}】技能",
+            )
 
         # 已学习后：始终委托给学到的技能（无论是否末狼）
         # 末狼时的刀人由 _get_role_players 将机械狼加入狼人击杀轮处理

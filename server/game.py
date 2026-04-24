@@ -1011,7 +1011,9 @@ class Game:
                 trigger_audio = learned.open_audio
                 await self._broadcast_notification(
                     f"{seat} 号请执行操作",
-                    audio=trigger_audio if trigger_audio else [self._seat_audio(seat), "请执行操作.mp3"],
+                    audio=trigger_audio
+                    if trigger_audio
+                    else [self._seat_audio(seat), "请执行操作.mp3"],
                 )
                 results = await self._request_action([seat], learned, message="请选择目标")
                 target = results.get(seat)
@@ -1029,7 +1031,6 @@ class Game:
                                 "player_died", f"{s} 号 {killed.nickname} 被技能击杀", {"seat": s}
                             )
                             await self._run_badge_transfer(s)
-                            await self._notify_gravedigger(s)
                             await self._handle_on_death(s, cause=inner_cause)
                             if not self._check_win() and not killed.is_alive:
                                 await self._run_last_words(s)
@@ -1068,7 +1069,6 @@ class Game:
                         "player_died", f"{s} 号 {killed.nickname} 被技能击杀", {"seat": s}
                     )
                     await self._run_badge_transfer(s)
-                    await self._notify_gravedigger(s)
                     await self._handle_on_death(s, cause=inner_cause)
                     if not self._check_win() and not killed.is_alive:
                         await self._run_last_words(s)
@@ -1105,7 +1105,6 @@ class Game:
         eliminated = self.get_player_by_seat(eliminated_seat)
         if not eliminated or not eliminated.role:
             return
-        role_name = eliminated.role.display_name
         camp = "狼人" if eliminated.team == "狼人" else "好人"
         gravediggers = [p for p in self.get_alive_players() if p.role and p.role.name == "守墓人"]
         for gd in gravediggers:
@@ -1201,7 +1200,7 @@ class Game:
             self._force_night = True
             return False
 
-        elif result.result_type == "knight_lose":
+        if result.result_type == "knight_lose":
             # 骑士自己死亡，游戏继续
             knight.is_alive = False
             self.events.log(
