@@ -43,6 +43,7 @@ class RoleContext:
     night_state: NightState
     seer_results: dict[int, list]  # {seer_seat: [SeerResult, ...]}
     round: int = 0
+    voters: list[int] = field(default_factory=list)  # 投票给当前出局者的玩家座位列表（炸弹人用）
 
     def get_alive_players(self) -> list["Player"]:
         return [p for p in self.players if p.is_alive]
@@ -120,6 +121,10 @@ class Role(ABC):
 
     def can_skip(self) -> bool:
         return True
+
+    def get_action_options(self) -> dict:
+        """返回附加选项供前端展示（key=target_seat字符串，value=选项说明）。默认无附加选项。"""
+        return {}
 
     @abstractmethod
     def get_valid_targets(self, player: "Player", ctx: RoleContext) -> list[int]:
@@ -312,12 +317,12 @@ class HunterRole(Role, role_name="猎人"):
         if self._shot:
             return ActionResult(False, "已经开过枪了")
         if target_seat is None:
-            return ActionResult(True, "猎人选择放弃开枪", private=False)
+            return ActionResult(True, "玩家选择放弃开枪", private=False)
         target = ctx.get_player_by_seat(target_seat)
         self._shot = True
         return ActionResult(
             True,
-            f"猎人开枪带走了 {target_seat} 号 {target.nickname}！",
+            f"玩家开枪带走了 {target_seat} 号 {target.nickname}！",
             affected_seats=[target_seat],
             private=False,
         )
@@ -358,7 +363,7 @@ class IdiotRole(Role, role_name="白痴"):
 # ──────────────────────────── 新增角色 ────────────────────────────
 
 
-class MirrorGirlRole(Role, role_name="灵镜少女"):
+class MirrorGirlRole(Role, role_name="魔镜少女"):
     """加强版预言家：每晚可查验一名玩家的具体身份（职业名）"""
 
     team = "神职"
@@ -370,7 +375,7 @@ class MirrorGirlRole(Role, role_name="灵镜少女"):
         self, player: "Player", target_seat: Optional[int], ctx: RoleContext
     ) -> ActionResult:
         if not target_seat:
-            raise ValueError("灵镜少女查验必须指定目标")
+            raise ValueError("魔镜少女查验必须指定目标")
         target = ctx.get_player_by_seat(target_seat)
         if not target.role:
             raise ValueError(f"目标 {target_seat} 没有角色信息")
@@ -413,12 +418,12 @@ class BlackWolfKingRole(Role, role_name="黑狼王"):
         if self._shot:
             return ActionResult(False, "已经开过枪了")
         if target_seat is None:
-            return ActionResult(True, "黑狼王选择放弃开枪", private=False)
+            return ActionResult(True, "玩家选择放弃开枪", private=False)
         target = ctx.get_player_by_seat(target_seat)
         self._shot = True
         return ActionResult(
             True,
-            f"黑狼王开枪带走了 {target_seat} 号 {target.nickname}！",
+            f"玩家开枪带走了 {target_seat} 号 {target.nickname}！",
             affected_seats=[target_seat],
             private=False,
         )
@@ -476,15 +481,14 @@ class GravediggerRole(Role, role_name="守墓人"):
 
 
 class GargoyleRole(Role, role_name="石像鬼"):
-    """狼人版灵镜少女：每晚可查验一名玩家的具体身份。所有其他狼人出局后才能刀人"""
+    """狼人版魔镜少女：每晚可查验一名玩家的具体身份。所有其他狼人出局后才能刀人"""
 
     team = "狼人"
 
     def get_valid_targets(self, player: "Player", ctx: RoleContext) -> list[int]:
         # 判断是否有其他活着的狼人（不含自身）
         other_wolves = [
-            p for p in ctx.get_alive_players()
-            if p.seat != player.seat and p.team == "狼人"
+            p for p in ctx.get_alive_players() if p.seat != player.seat and p.team == "狼人"
         ]
         if other_wolves:
             # 查验模式：不能选自己
@@ -575,10 +579,10 @@ class MechWolfRole(Role, role_name="机械狼"):
     def __init__(self, config: RoleConfig, raw: dict):
         super().__init__(config, raw)
         self.learned_role: Optional["Role"] = None  # 学到的技能对应角色实例
-        self.learned_display: str = ""              # 伪装时展示的角色名
-        self.learned_team: str = ""                 # 学习目标的原始阵营
-        self.ignore_guard: bool = False             # 是否获得了破盾刀（学习了狼人）
-        self._learned: bool = False                 # 是否已完成第一晚学习
+        self.learned_display: str = ""  # 伪装时展示的角色名
+        self.learned_team: str = ""  # 学习目标的原始阵营
+        self.ignore_guard: bool = False  # 是否获得了破盾刀（学习了狼人）
+        self._learned: bool = False  # 是否已完成第一晚学习
 
     def can_use(self, player: "Player", ctx: RoleContext) -> bool:
         if not player.is_alive:
@@ -588,8 +592,7 @@ class MechWolfRole(Role, role_name="机械狼"):
             return ctx.round == 1
         # 已学习：检查行动模式
         other_wolves = [
-            p for p in ctx.get_alive_players()
-            if p.seat != player.seat and p.team == "狼人"
+            p for p in ctx.get_alive_players() if p.seat != player.seat and p.team == "狼人"
         ]
         # 有无其他狼均委托给 learned_role；破盾刀（learned_role=None）时末狼由狼人击杀轮处理
         if self.learned_role is not None:
@@ -601,8 +604,7 @@ class MechWolfRole(Role, role_name="机械狼"):
             return [p.seat for p in ctx.get_alive_players() if p.seat != player.seat]
 
         other_wolves = [
-            p for p in ctx.get_alive_players()
-            if p.seat != player.seat and p.team == "狼人"
+            p for p in ctx.get_alive_players() if p.seat != player.seat and p.team == "狼人"
         ]
         if self.learned_role is not None:
             if isinstance(self.learned_role, WitchRole):
@@ -673,6 +675,79 @@ class MechWolfRole(Role, role_name="机械狼"):
         if self.learned_display:
             d["learned_display"] = self.learned_display
         return d
+
+
+class BearRole(Role, role_name="熊"):
+    """神职被动角色：每天天亮时，若左右两侧存活邻居含狼人阵营则咆哮（由 game.py 广播）"""
+
+    team = "神职"
+
+    def can_use(self, player: "Player", ctx: RoleContext) -> bool:
+        """返回 True 表示熊咆哮（左右存活邻居中有狼人）"""
+        if not player.is_alive:
+            return False
+        alive = sorted(ctx.get_alive_players(), key=lambda p: p.seat)
+        if len(alive) < 2:
+            return False
+        bear_idx = next((i for i, p in enumerate(alive) if p.seat == player.seat), None)
+        if bear_idx is None:
+            return False
+        left = alive[(bear_idx - 1) % len(alive)]
+        right = alive[(bear_idx + 1) % len(alive)]
+        return left.team == "狼人" or right.team == "狼人"
+
+    def get_valid_targets(self, player: "Player", ctx: RoleContext) -> list[int]:
+        return []
+
+    def execute(
+        self, player: "Player", target_seat: Optional[int], ctx: RoleContext
+    ) -> ActionResult:
+        return ActionResult(True, "熊待机")
+
+
+class BomberRole(Role, role_name="炸弹人"):
+    """神职角色：被投票出局时，可选择引爆炸弹带走所有投票者"""
+
+    team = "神职"
+
+    def __init__(self, config: RoleConfig, raw: dict):
+        super().__init__(config, raw)
+        self._exploded = False
+
+    def can_use(self, player: "Player", ctx: RoleContext) -> bool:
+        return not self._exploded
+
+    def requires_target(self) -> bool:
+        return True
+
+    def can_skip(self) -> bool:
+        return True
+
+    def get_valid_targets(self, player: "Player", ctx: RoleContext) -> list[int]:
+        return [0]
+
+    def get_action_options(self) -> dict:
+        return {"0": "引爆炸弹，带走所有投票者"}
+
+    def execute(
+        self, player: "Player", target_seat: Optional[int], ctx: RoleContext
+    ) -> ActionResult:
+        if target_seat != 0:
+            return ActionResult(False, "炸弹人：无效操作")
+        self._exploded = True
+        affected = [s for s in ctx.voters if s != player.seat]
+        if affected:
+            names = "、".join(f"{s} 号" for s in affected)
+            msg = f"引爆！{names} 死亡！"
+        else:
+            msg = "引爆！但没有玩家被带走"
+        return ActionResult(
+            True,
+            msg,
+            affected_seats=affected,
+            result_type="bomb",
+            private=False,
+        )
 
 
 # ──────────────────────────── 工厂函数 ────────────────────────────

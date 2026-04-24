@@ -13,6 +13,7 @@ from server.messages import GameStateData, SeerResultItem
 from .events import EventLog
 from .player import Player
 from .roles import (
+    BearRole,
     KnightRole,
     MechWolfRole,
     NightState,
@@ -69,6 +70,7 @@ class Game:
         # 从配置加载的数据
         self._role_map: dict[str, dict] = {}  # {role_name: raw_role_dict}
         self._night_actions: list[str] = []  # game_stages 中夜晚阶段的角色名列表
+        self._day_actions: list[str] = []  # game_stages 中白天阶段的角色名列表
         self._preset_name: str = ""  # 当前使用的预设名称
 
         # 动作协调
@@ -89,6 +91,10 @@ class Game:
         # 骑士决斗等待处理队列 {seat: knight_seat, target: target_seat}
         self._pending_knight_duel: Optional[dict] = None
 
+        # 投票记录（炸弹人技能用）
+        self._last_vote_results: dict[int, int] = {}  # voter_seat → target_seat
+        self._pending_voters: list[int] = []  # 当前待处理中死亡者的投票人列表
+
     # ──────────────────────────── 配置加载 ────────────────────────────
 
     def load_config(self, config: dict) -> None:
@@ -96,10 +102,13 @@ class Game:
         self._role_map = build_role_map(config.get("roles", []))
 
         self._night_actions = []
+        self._day_actions = []
         for stage in config.get("game_stages", []):
             if stage["name"] == "夜晚":
                 # actions 现在是纯角色名字符串列表
                 self._night_actions = [a for a in stage.get("actions", []) if isinstance(a, str)]
+            elif stage["name"] == "白天":
+                self._day_actions = [a for a in stage.get("actions", []) if isinstance(a, str)]
 
         # 若夜晚行动引用了"狼人"但角色表中无此条目（配置中无标准狼人），从全局 roles.yml 补充
         # 确保狼人击杀阶段可以获取到音频/消息配置
@@ -146,6 +155,7 @@ class Game:
             night_state=self.night_state,
             seer_results=self.seer_results,
             round=self.round,
+            voters=list(self._pending_voters),
         )
 
     # ──────────────────────────── 游戏流程 ────────────────────────────
@@ -762,6 +772,21 @@ class Game:
         deaths = await self._process_night_deaths()
         await self._broadcast_game_state()
 
+        # ── 熊咆哮 ──────────────────────────────────────────────────────
+        if "熊" in self._day_actions:
+            ctx = self._make_ctx()
+            for p in self.players:  # 遍历所有玩家找熊（含死亡）
+                if isinstance(p.role, BearRole):
+                    if p.is_alive:
+                        growl = p.role.can_use(p, ctx)
+                        self.events.log("notification", "熊发出了咆哮！" if growl else "熊保持平静")
+                        await self._broadcast_notification(
+                            "熊发出了咆哮！" if growl else "熊保持平静",
+                            audio="熊咆哮了.mp3" if growl else "熊没有咆哮.mp3",
+                            wait=True,
+                        )
+                    break  # 只处理第一只熊
+
         if self._check_force_night():
             return False
 
@@ -875,7 +900,11 @@ class Game:
             await self._broadcast_game_state()
             await self._run_badge_transfer(loser_seat)
             await self._notify_gravedigger(loser_seat)
+            self._pending_voters = [
+                s for s, t in self._last_vote_results.items() if t == loser_seat
+            ]
             await self._handle_on_death(loser_seat, cause="vote")
+            self._pending_voters = []
             # 白痴翻牌后 is_alive=True，跳过遗言
             if not self._check_win() and not loser.is_alive:
                 await self._run_last_words(loser_seat)
@@ -965,10 +994,10 @@ class Game:
         ctx = self._make_ctx()
         role = player.role
 
-        # 根据死因过滤可触发的阶段；毒死不触发任何死亡技能
+        # 根据死因过滤可触发的阶段；毒死和炸弹引爆均不触发任何死亡技能
         _night_phases = {RolePhase.ON_NIGHT_KILL, RolePhase.ON_DEATH}
         _vote_phases = {RolePhase.ON_VOTE_OUT, RolePhase.ON_DEATH}
-        if cause == "poison":
+        if cause in ("poison", "bomb"):
             allowed = set()
         elif cause == "night_kill":
             allowed = _night_phases
@@ -981,8 +1010,8 @@ class Game:
             if learned.phase in allowed and learned.can_use(player, ctx):
                 trigger_audio = learned.open_audio
                 await self._broadcast_notification(
-                    f"{seat} 号 {player.nickname} 触发习得技能：{learned.display_name}",
-                    audio=trigger_audio,
+                    f"{seat} 号请执行操作",
+                    audio=trigger_audio if trigger_audio else [self._seat_audio(seat), "请执行操作.mp3"],
                 )
                 results = await self._request_action([seat], learned, message="请选择目标")
                 target = results.get(seat)
@@ -991,6 +1020,7 @@ class Game:
                     result = learned.execute(player, target, ctx)
                     await self._broadcast_notification(result.message)
                     await self._broadcast_game_state()
+                    inner_cause = "bomb" if result.result_type == "bomb" else cause
                     for s in result.affected_seats:
                         killed = self.get_player_by_seat(s)
                         if killed and killed.is_alive:
@@ -1000,9 +1030,11 @@ class Game:
                             )
                             await self._run_badge_transfer(s)
                             await self._notify_gravedigger(s)
-                            await self._handle_on_death(s, cause=cause)
+                            await self._handle_on_death(s, cause=inner_cause)
                             if not self._check_win() and not killed.is_alive:
                                 await self._run_last_words(s)
+                else:
+                    await self._broadcast_notification(f"{seat} 号 {player.nickname} 放弃操作")
             return
 
         if role.phase not in allowed or not role.can_use(player, ctx):
@@ -1017,8 +1049,8 @@ class Game:
 
         trigger_audio = role.open_audio
         await self._broadcast_notification(
-            f"{seat} 号 {player.nickname} 触发技能：{role.display_name}",
-            audio=trigger_audio,
+            f"{seat} 号请执行操作",
+            audio=trigger_audio if trigger_audio else [self._seat_audio(seat), "请执行操作.mp3"],
         )
         results = await self._request_action([seat], role, message="请选择目标")
         target = results.get(seat)
@@ -1027,6 +1059,7 @@ class Game:
             result = role.execute(player, target, ctx)
             await self._broadcast_notification(result.message)
             await self._broadcast_game_state()
+            inner_cause = "bomb" if result.result_type == "bomb" else cause
             for s in result.affected_seats:
                 killed = self.get_player_by_seat(s)
                 if killed and killed.is_alive:
@@ -1036,9 +1069,11 @@ class Game:
                     )
                     await self._run_badge_transfer(s)
                     await self._notify_gravedigger(s)
-                    await self._handle_on_death(s, cause=cause)
+                    await self._handle_on_death(s, cause=inner_cause)
                     if not self._check_win() and not killed.is_alive:
                         await self._run_last_words(s)
+        else:
+            await self._broadcast_notification(f"{seat} 号 {player.nickname} 放弃操作")
 
     # ──────────────────────────── 胜负判断 ────────────────────────────
 
@@ -1212,6 +1247,7 @@ class Game:
                     "requires_target": role.requires_target(),
                     "can_skip": role.can_skip(),
                     "is_group": len(seats) > 1,
+                    "options": role.get_action_options(),
                 },
             }
             self._pending_seat_messages[seat] = msg_data
@@ -1367,6 +1403,7 @@ class Game:
         返回 None 表示无胜者（无有效票）或强制入夜。
         """
         votes = await self._request_vote(voter_seats, candidates, timeout=120.0)
+        current_votes = votes
         self.voting_candidates = []
 
         if self._force_night:
@@ -1418,6 +1455,7 @@ class Game:
             await self._broadcast_game_state()
             re_voter_seats = re_voters_fn(top)
             re_votes = await self._request_vote(re_voter_seats, top, timeout=120.0)
+            current_votes = re_votes
             self.voting_candidates = []
             if self._force_night:
                 return None
@@ -1434,6 +1472,7 @@ class Game:
             max_votes = max(tally.values())
             top = [s for s, v in tally.items() if v == max_votes]
 
+        self._last_vote_results = {s: t for s, t in current_votes.items() if isinstance(t, int)}
         return top[0]
 
     async def _wait_speech_end(self, seat: int, timeout: float = 180.0):
@@ -1641,6 +1680,7 @@ class Game:
         self.seer_results = {}
         self._role_map = {}
         self._night_actions = []
+        self._day_actions = []
         self._preset_name = ""
         self._force_night = False
         self._pending_seat_messages = {}

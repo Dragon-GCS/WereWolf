@@ -82,20 +82,20 @@ roles:
     description: 被投票出局时翻牌，保留座位但失去投票权
     phase: on_vote_out
 
-  - name: 灵镜少女
-    display_name: 灵镜少女
+  - name: 魔镜少女
+    display_name: 魔镜少女
     team: 神职
     description: 每晚可查验一名玩家的具体身份（加强版预言家，显示职业名）
     phase: night
-    open_msg: 灵镜少女请睁眼
+    open_msg: 魔镜少女请睁眼
     open_audio:
-      - 灵镜少女.mp3
+      - 魔镜少女.mp3
       - 请睁眼.mp3
     action_audio:
       - 请执行操作.mp3
-    close_msg: 灵镜少女请闭眼
+    close_msg: 魔镜少女请闭眼
     close_audio:
-      - 灵镜少女.mp3
+      - 魔镜少女.mp3
       - 请闭眼.mp3
 
   - name: 机械狼
@@ -123,7 +123,7 @@ roles:
   - name: 吸血鬼
     display_name: 吸血鬼
     team: 狼人
-    description: 第一晚可指定一名玩家将其阵营转变为狼人（身份和技能不变）；第二晚起被查验时显示为狼人；灵镜少女可获取原始身份和转化信息
+    description: 第一晚可指定一名玩家将其阵营转变为狼人（身份和技能不变）；第二晚起被查验时显示为狼人；魔镜少女可获取原始身份和转化信息
     phase: night
     open_msg: 吸血鬼请睁眼
     open_audio:
@@ -144,7 +144,7 @@ roles:
   - name: 石像鬼
     display_name: 石像鬼
     team: 狼人
-    description: 每晚可查验一名玩家的具体身份（狼人版灵镜少女）；其他狼人全部出局后才能刀人
+    description: 每晚可查验一名玩家的具体身份（狼人版魔镜少女）；其他狼人全部出局后才能刀人
     phase: night
     open_msg: 石像鬼请睁眼
     open_audio:
@@ -161,3 +161,14 @@ roles:
     display_name: 骑士
     team: 神职
     description: 白天发言期间可亮明身份发起决斗；决斗狼人→狼人立即死亡进入黑夜；决斗好人→骑士自己死亡；每局只能决斗一次
+
+  - name: 熊
+    display_name: 熊
+    team: 神职
+    description: 被动技能，每天天亮时检测左右两侧存活邻居，若含有狼人阵营则全局广播咆哮
+
+  - name: 炸弹人
+    display_name: 炸弹人
+    team: 神职
+    description: 被投票出局时，可选择引爆炸弹带走所有投票给自己的玩家（被带走者不触发死亡技能）
+    phase: on_vote_out
